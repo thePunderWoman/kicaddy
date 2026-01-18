@@ -1,0 +1,17 @@
+[package]
+name = "libkicaddy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Library for parsing and manipulating KiCAD files"
+
+[dependencies]
+thiserror = "2"
+nom = "8"
+nom-language = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tantivy = "0.22"
+dirs = "5"
