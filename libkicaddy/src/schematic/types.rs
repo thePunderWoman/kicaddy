@@ -2,8 +2,65 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{Color, Effects, Point, Position, Property, Stroke};
+use crate::common::{Color, Effects, Font, HorizontalJustify, Justify, Point, Position, Property, Stroke};
 use crate::symbol::Symbol;
+
+/// Check if a pin query matches a pin's number or name
+/// Supports flexible matching for pins with aliases like "EN/CHIP_PU":
+/// - Exact match on pin number (e.g., "1", "2")
+/// - Exact match on pin name (e.g., "EN/CHIP_PU")
+/// - Match on any alias in a "/" separated name (e.g., "EN" or "CHIP_PU")
+pub fn pin_matches(query: &str, pin_number: &str, pin_name: &str) -> bool {
+    // Exact match on pin number
+    if query == pin_number {
+        return true;
+    }
+
+    // Exact match on pin name
+    if query == pin_name {
+        return true;
+    }
+
+    // Check if query matches any alias in the pin name (split by "/")
+    if pin_name.contains('/') {
+        for alias in pin_name.split('/') {
+            if query == alias.trim() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Create label effects with proper font and justification for a given angle.
+/// KiCAD labels need specific justification to position the connection point correctly:
+/// The label's connection point should face toward the pin it connects to.
+/// - Angle 0 (label points right) or 90 (up) → justify right (connection on right/bottom)
+/// - Angle 180 (label points left) or 270 (down) → justify left (connection on left/top)
+fn label_effects_for_angle(angle: f64) -> Effects {
+    let normalized = ((angle as i32) % 360 + 360) % 360;
+    let horizontal = match normalized {
+        0 | 90 => HorizontalJustify::Right,
+        180 | 270 => HorizontalJustify::Left,
+        _ => HorizontalJustify::Right, // default
+    };
+
+    Effects {
+        font: Some(Font {
+            size: Some((1.27, 1.27)),
+            thickness: None,
+            bold: false,
+            italic: false,
+        }),
+        justify: Some(Justify {
+            horizontal,
+            vertical: Default::default(),
+            mirror: false,
+        }),
+        hide: false,
+    }
+}
 
 /// A complete schematic file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +199,23 @@ impl Schematic {
         if !self.lib_symbols.iter().any(|s| s.name == lib_id) {
             let mut lib_symbol = symbol.clone();
             lib_symbol.name = lib_id.to_string();
-            // Unit names stay as original (e.g., "R_0_1", not "Device:R_0_1")
+
+            // Update unit names to use the symbol name (without library prefix)
+            // Parent symbol name: "Device:R" (full lib_id)
+            // Unit names: "R_0_1", "R_1_1" (just symbol name + suffix)
+            // Note: Some symbols extend others, so unit prefix may differ from symbol name
+            let symbol_name = lib_id.split(':').last().unwrap_or(lib_id);
+            for unit in &mut lib_symbol.units {
+                // Find the _N_N suffix (unit and style numbers)
+                if let Some(suffix_pos) = unit.name.rfind('_') {
+                    if let Some(mid_pos) = unit.name[..suffix_pos].rfind('_') {
+                        // Extract _N_N suffix and combine with symbol name
+                        let suffix = &unit.name[mid_pos..];
+                        unit.name = format!("{}{}", symbol_name, suffix);
+                    }
+                }
+            }
+
             self.lib_symbols.push(lib_symbol);
         }
 
@@ -279,25 +352,20 @@ impl Schematic {
         let lib_symbol = self.lib_symbols.iter().find(|s| s.name == symbol.lib_id)?;
 
         // Find the pin in the symbol units (check both pin number and name)
+        // Supports flexible matching: "EN" matches pin named "EN/CHIP_PU"
         let lib_pin = lib_symbol
             .units
             .iter()
             .flat_map(|u| u.pins.iter())
-            .find(|p| p.number.number == pin || p.name.name == pin)?;
+            .find(|p| pin_matches(pin, &p.number.number, &p.name.name))?;
 
         // Get pin's local position and angle
+        // In KiCAD symbols, pin position IS the wire attachment point (tip)
+        // The pin angle indicates direction toward the symbol body
+        // Symbol local coords use Y-up, schematic world uses Y-down, so negate Y
         let pin_pos = lib_pin.position;
-        let pin_length = lib_pin.length;
-
-        // Calculate pin direction vector based on pin angle
-        // Pin angle 0 = pointing right, 90 = up, 180 = left, 270 = down
-        let pin_angle_rad = pin_pos.angle.to_radians();
-
-        // The pin's body starts at pin_pos and extends in the direction of pin_angle
-        // Wire attachment point is at the end of the pin (away from symbol body)
-        // The tip (wire attachment) is at pin_pos - (pin_length in pin direction)
-        let tip_local_x = pin_pos.x - pin_length * pin_angle_rad.cos();
-        let tip_local_y = pin_pos.y + pin_length * pin_angle_rad.sin();
+        let tip_local_x = pin_pos.x;
+        let tip_local_y = -pin_pos.y;
 
         // Apply mirror transformation if set
         let (mirrored_x, mirrored_y, angle_adjust) = match symbol.mirror {
@@ -345,6 +413,7 @@ impl Schematic {
     }
 
     /// Add wire with routing mode
+    /// For orthogonal routing, creates multiple wire segments with junctions at corners
     pub fn add_wire_routed(&mut self, from: Point, to: Point, mode: RoutingMode) {
         const GRID: f64 = 1.27;
         let snapped_from = Point::new(
@@ -356,16 +425,37 @@ impl Schematic {
             (to.y / GRID).round() * GRID,
         );
 
-        let points = match mode {
-            RoutingMode::Direct => vec![snapped_from, snapped_to],
+        match mode {
+            RoutingMode::Direct => {
+                self.wires.push(Wire {
+                    points: vec![snapped_from, snapped_to],
+                    stroke: Stroke::default(),
+                    uuid: uuid::Uuid::new_v4().to_string(),
+                });
+            }
             RoutingMode::Orthogonal => {
                 // Horizontal then vertical
                 let mid = Point::new(snapped_to.x, snapped_from.y);
                 if (mid.x - snapped_from.x).abs() < 0.001 || (mid.y - snapped_to.y).abs() < 0.001 {
                     // Already aligned, single segment
-                    vec![snapped_from, snapped_to]
+                    self.wires.push(Wire {
+                        points: vec![snapped_from, snapped_to],
+                        stroke: Stroke::default(),
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                    });
                 } else {
-                    vec![snapped_from, mid, snapped_to]
+                    // Two segments with junction at corner
+                    self.wires.push(Wire {
+                        points: vec![snapped_from, mid],
+                        stroke: Stroke::default(),
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                    });
+                    self.wires.push(Wire {
+                        points: vec![mid, snapped_to],
+                        stroke: Stroke::default(),
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                    });
+                    self.add_junction(mid);
                 }
             }
             RoutingMode::OrthogonalVH => {
@@ -373,19 +463,27 @@ impl Schematic {
                 let mid = Point::new(snapped_from.x, snapped_to.y);
                 if (mid.y - snapped_from.y).abs() < 0.001 || (mid.x - snapped_to.x).abs() < 0.001 {
                     // Already aligned, single segment
-                    vec![snapped_from, snapped_to]
+                    self.wires.push(Wire {
+                        points: vec![snapped_from, snapped_to],
+                        stroke: Stroke::default(),
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                    });
                 } else {
-                    vec![snapped_from, mid, snapped_to]
+                    // Two segments with junction at corner
+                    self.wires.push(Wire {
+                        points: vec![snapped_from, mid],
+                        stroke: Stroke::default(),
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                    });
+                    self.wires.push(Wire {
+                        points: vec![mid, snapped_to],
+                        stroke: Stroke::default(),
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                    });
+                    self.add_junction(mid);
                 }
             }
         };
-
-        let wire = Wire {
-            points,
-            stroke: Stroke::default(),
-            uuid: uuid::Uuid::new_v4().to_string(),
-        };
-        self.wires.push(wire);
     }
 
     /// Add junction at point
@@ -418,7 +516,7 @@ impl Schematic {
             text: text.to_string(),
             position: snapped_pos,
             fields_autoplaced: true,
-            effects: Some(Effects::default()),
+            effects: Some(label_effects_for_angle(position.angle)),
             uuid: uuid::Uuid::new_v4().to_string(),
         };
         self.labels.push(label);
@@ -438,7 +536,7 @@ impl Schematic {
             shape,
             position: snapped_pos,
             fields_autoplaced: true,
-            effects: Some(Effects::default()),
+            effects: Some(label_effects_for_angle(position.angle)),
             uuid: uuid::Uuid::new_v4().to_string(),
             properties: vec![],
         };
@@ -942,4 +1040,42 @@ pub enum RoutingMode {
     Orthogonal,
     /// Vertical then horizontal
     OrthogonalVH,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pin_matches_exact_number() {
+        assert!(pin_matches("1", "1", "VCC"));
+        assert!(pin_matches("2", "2", "GND"));
+        assert!(!pin_matches("3", "1", "VCC"));
+    }
+
+    #[test]
+    fn test_pin_matches_exact_name() {
+        assert!(pin_matches("VCC", "1", "VCC"));
+        assert!(pin_matches("GND", "2", "GND"));
+        assert!(!pin_matches("VCC", "1", "GND"));
+    }
+
+    #[test]
+    fn test_pin_matches_alias() {
+        // Pin named "EN/CHIP_PU" should match "EN", "CHIP_PU", or full name
+        assert!(pin_matches("EN", "3", "EN/CHIP_PU"));
+        assert!(pin_matches("CHIP_PU", "3", "EN/CHIP_PU"));
+        assert!(pin_matches("EN/CHIP_PU", "3", "EN/CHIP_PU"));
+        assert!(!pin_matches("RESET", "3", "EN/CHIP_PU"));
+    }
+
+    #[test]
+    fn test_pin_matches_multiple_aliases() {
+        // Pin with multiple aliases
+        assert!(pin_matches("A", "1", "A/B/C"));
+        assert!(pin_matches("B", "1", "A/B/C"));
+        assert!(pin_matches("C", "1", "A/B/C"));
+        assert!(pin_matches("A/B/C", "1", "A/B/C"));
+        assert!(!pin_matches("D", "1", "A/B/C"));
+    }
 }

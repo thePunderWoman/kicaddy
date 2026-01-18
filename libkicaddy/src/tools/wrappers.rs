@@ -978,6 +978,175 @@ impl Tool for GetNetlistTool {
 }
 
 // ============================================================================
+// CompileYaml Tool
+// ============================================================================
+
+/// Input for compile_yaml tool
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompileYamlInput {
+    /// Path to the YAML schematic definition file
+    pub yaml_path: PathBuf,
+
+    /// Output path for the .kicad_sch file (optional, defaults to same name with .kicad_sch extension)
+    #[serde(default)]
+    pub output_path: Option<PathBuf>,
+
+    /// Only validate the YAML file without compiling
+    #[serde(default)]
+    pub validate_only: Option<bool>,
+}
+
+/// Output of compile_yaml tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileYamlOutput {
+    /// Output path of compiled schematic (None if validate_only)
+    pub output_path: Option<String>,
+    /// Number of components placed
+    pub components_placed: usize,
+    /// Number of connections made
+    pub connections_made: usize,
+    /// Validation/compilation warnings
+    pub warnings: Vec<String>,
+    /// Whether validation passed
+    pub is_valid: bool,
+    /// Validation errors (if any)
+    pub errors: Vec<String>,
+}
+
+pub struct CompileYamlTool;
+
+impl Tool for CompileYamlTool {
+    const NAME: &'static str = "compile_yaml";
+    const DESCRIPTION: &'static str = "Compile a YAML schematic definition to KiCAD format. The YAML file defines components, positions, and connections declaratively.";
+
+    type Input = CompileYamlInput;
+    type Output = CompileYamlOutput;
+
+    fn execute(input: Self::Input) -> Result<Self::Output, ToolError> {
+        use crate::yaml::{Compiler, YamlSchematic};
+
+        // Parse the YAML file
+        let yaml_sch = YamlSchematic::from_file(&input.yaml_path)
+            .map_err(|e| ToolError::InvalidInput(format!("YAML parse error: {}", e)))?;
+
+        // Create the compiler
+        let compiler = Compiler::new()
+            .map_err(|e| ToolError::ConfigError(format!("KiCAD config error: {}", e)))?;
+
+        if input.validate_only.unwrap_or(false) {
+            // Validate only
+            let result = compiler.validate(&yaml_sch);
+            let is_valid = result.is_valid();
+            let errors: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
+            Ok(CompileYamlOutput {
+                output_path: None,
+                components_placed: 0,
+                connections_made: 0,
+                warnings: result.warnings,
+                is_valid,
+                errors,
+            })
+        } else {
+            // Compile
+            match compiler.compile(&yaml_sch) {
+                Ok(compile_output) => {
+                    // Determine output path
+                    let output_path = input
+                        .output_path
+                        .unwrap_or_else(|| input.yaml_path.with_extension("kicad_sch"));
+
+                    // Write the schematic
+                    compile_output
+                        .schematic
+                        .write_to_file(&output_path)
+                        .map_err(|e| ToolError::WriteError(e.to_string()))?;
+
+                    Ok(CompileYamlOutput {
+                        output_path: Some(output_path.to_string_lossy().to_string()),
+                        components_placed: compile_output.components_placed.len(),
+                        connections_made: compile_output.connections_made,
+                        warnings: compile_output.warnings,
+                        is_valid: true,
+                        errors: Vec::new(),
+                    })
+                }
+                Err(e) => Ok(CompileYamlOutput {
+                    output_path: None,
+                    components_placed: 0,
+                    connections_made: 0,
+                    warnings: Vec::new(),
+                    is_valid: false,
+                    errors: vec![e.to_string()],
+                }),
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WriteYamlSchematic Tool
+// ============================================================================
+
+/// Input for write_yaml_schematic tool
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WriteYamlSchematicInput {
+    /// Path for the new YAML file
+    pub path: PathBuf,
+
+    /// Template to use: "basic", "regulator", or "led" (default: "basic")
+    #[serde(default)]
+    pub template: Option<String>,
+
+    /// Custom YAML content (overrides template if provided)
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+/// Output of write_yaml_schematic tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteYamlSchematicOutput {
+    /// Path of created YAML file
+    pub path: String,
+    /// Template used (or "custom" if content was provided)
+    pub template: String,
+}
+
+pub struct WriteYamlSchematicTool;
+
+impl Tool for WriteYamlSchematicTool {
+    const NAME: &'static str = "write_yaml_schematic";
+    const DESCRIPTION: &'static str = "Create a new YAML schematic definition file from a template or custom content. Templates: basic (empty), regulator (LDO circuit), led (LED with resistor).";
+
+    type Input = WriteYamlSchematicInput;
+    type Output = WriteYamlSchematicOutput;
+
+    fn execute(input: Self::Input) -> Result<Self::Output, ToolError> {
+        use crate::yaml::YamlTemplate;
+
+        let (content, template_name) = if let Some(custom_content) = input.content {
+            (custom_content, "custom".to_string())
+        } else {
+            let template_str = input.template.as_deref().unwrap_or("basic");
+            let template = YamlTemplate::from_str(template_str)
+                .ok_or_else(|| ToolError::InvalidInput(format!(
+                    "Unknown template '{}'. Available: basic, regulator, led",
+                    template_str
+                )))?;
+            (template.content().to_string(), template_str.to_string())
+        };
+
+        // Write the file
+        std::fs::write(&input.path, &content)
+            .map_err(|e| ToolError::WriteError(e.to_string()))?;
+
+        Ok(WriteYamlSchematicOutput {
+            path: input.path.to_string_lossy().to_string(),
+            template: template_name,
+        })
+    }
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 

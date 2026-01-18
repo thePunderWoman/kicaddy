@@ -198,6 +198,16 @@ impl ToolRegistry {
                 description: wrappers::GetNetlistTool::DESCRIPTION.to_string(),
                 input_schema: wrappers::GetNetlistTool::input_schema(),
             },
+            ToolMetadata {
+                name: wrappers::CompileYamlTool::NAME.to_string(),
+                description: wrappers::CompileYamlTool::DESCRIPTION.to_string(),
+                input_schema: wrappers::CompileYamlTool::input_schema(),
+            },
+            ToolMetadata {
+                name: wrappers::WriteYamlSchematicTool::NAME.to_string(),
+                description: wrappers::WriteYamlSchematicTool::DESCRIPTION.to_string(),
+                input_schema: wrappers::WriteYamlSchematicTool::input_schema(),
+            },
         ]
     }
 
@@ -286,6 +296,18 @@ impl ToolRegistry {
                 let input: wrappers::GetNetlistInput = serde_json::from_value(input)
                     .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
                 let output = wrappers::GetNetlistTool::execute(input)?;
+                serde_json::to_value(output).map_err(|e| ToolError::Other(e.to_string()))
+            }
+            wrappers::CompileYamlTool::NAME => {
+                let input: wrappers::CompileYamlInput = serde_json::from_value(input)
+                    .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+                let output = wrappers::CompileYamlTool::execute(input)?;
+                serde_json::to_value(output).map_err(|e| ToolError::Other(e.to_string()))
+            }
+            wrappers::WriteYamlSchematicTool::NAME => {
+                let input: wrappers::WriteYamlSchematicInput = serde_json::from_value(input)
+                    .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+                let output = wrappers::WriteYamlSchematicTool::execute(input)?;
                 serde_json::to_value(output).map_err(|e| ToolError::Other(e.to_string()))
             }
             _ => Err(ToolError::Other(format!("Unknown tool: {}", name))),

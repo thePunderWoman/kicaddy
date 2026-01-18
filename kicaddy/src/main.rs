@@ -16,7 +16,7 @@ use libkicaddy::tools::{
 };
 use libkicaddy::{
     build_index, find_symbol, parse_schematic, parse_symbol_library, search, KicadConfig,
-    SearchOptions,
+    SearchOptions, YamlSchematic, YamlTemplate,
 };
 
 #[derive(Parser)]
@@ -216,6 +216,25 @@ enum Commands {
     },
     /// Start MCP server for AI assistant integration
     Mcp,
+    /// Compile a YAML schematic definition to KiCAD format
+    Compile {
+        /// Path to the YAML schematic definition file
+        yaml: PathBuf,
+        /// Output path for the .kicad_sch file (default: same name with .kicad_sch extension)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Only validate the YAML file without compiling
+        #[arg(long)]
+        validate: bool,
+    },
+    /// Create a new YAML schematic template
+    InitYaml {
+        /// Path for the new YAML file
+        path: PathBuf,
+        /// Template to use: basic, regulator, led (default: basic)
+        #[arg(short, long, default_value = "basic")]
+        template: String,
+    },
 }
 
 fn main() {
@@ -924,6 +943,104 @@ fn main() {
             if let Err(e) = rt.block_on(mcp::run_server()) {
                 eprintln!("MCP server error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::Compile {
+            yaml,
+            output,
+            validate,
+        } => {
+            // Parse the YAML file
+            let yaml_sch = match YamlSchematic::from_file(&yaml) {
+                Ok(sch) => sch,
+                Err(e) => {
+                    eprintln!("Error parsing YAML: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Create the compiler
+            let compiler = match libkicaddy::yaml::Compiler::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if validate {
+                // Validate only
+                let result = compiler.validate(&yaml_sch);
+                if result.is_valid() {
+                    println!("YAML schematic is valid");
+                    for warning in &result.warnings {
+                        println!("Warning: {}", warning);
+                    }
+                } else {
+                    eprintln!("Validation errors:");
+                    for error in &result.errors {
+                        eprintln!("  - {}", error);
+                    }
+                    for warning in &result.warnings {
+                        println!("Warning: {}", warning);
+                    }
+                    std::process::exit(1);
+                }
+            } else {
+                // Compile
+                match compiler.compile(&yaml_sch) {
+                    Ok(compile_output) => {
+                        // Determine output path
+                        let output_path = output.unwrap_or_else(|| {
+                            yaml.with_extension("kicad_sch")
+                        });
+
+                        // Write the schematic
+                        if let Err(e) = compile_output.schematic.write_to_file(&output_path) {
+                            eprintln!("Error writing schematic: {}", e);
+                            std::process::exit(1);
+                        }
+
+                        println!("Compiled {} to {}", yaml.display(), output_path.display());
+                        println!(
+                            "  Components placed: {}",
+                            compile_output.components_placed.len()
+                        );
+                        println!("  Connections made: {}", compile_output.connections_made);
+
+                        for warning in &compile_output.warnings {
+                            println!("Warning: {}", warning);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Compilation error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::InitYaml { path, template } => {
+            // Get the template
+            let template_type = match YamlTemplate::from_str(&template) {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "Unknown template '{}'. Available: basic, regulator, led",
+                        template
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            // Write the template
+            match std::fs::write(&path, template_type.content()) {
+                Ok(()) => {
+                    println!("Created YAML schematic template: {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("Error writing file: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }

@@ -50,7 +50,8 @@ pub enum ConnectionKind {
 
 impl ConnectivityGraph {
     /// Tolerance for matching connection points (in mm)
-    const TOLERANCE: f64 = 0.5;
+    /// Very small - just for floating-point comparison, not for "nearby" matching
+    const TOLERANCE: f64 = 0.01;
 
     /// Build a connectivity graph from a schematic
     pub fn from_schematic(schematic: &Schematic) -> Self {
@@ -64,8 +65,9 @@ impl ConnectivityGraph {
 
         graph.collect_connection_points(schematic);
         graph.initialize_union_find();
-        graph.connect_nearby_points();
+        graph.connect_at_junctions(schematic);
         graph.connect_wire_segments(schematic);
+        graph.connect_labels_to_wires();
         graph.build_net_groups();
         graph.assign_net_names();
 
@@ -110,13 +112,22 @@ impl ConnectivityGraph {
             }
         }
 
-        // Add wire endpoints
+        // Add wire start/end points only (not intermediate corners)
+        // This prevents false connections when orthogonal wires cross
         for wire in &schematic.wires {
-            for point in &wire.points {
+            if let Some(first) = wire.points.first() {
                 self.connection_points.push(ConnectionPoint {
-                    position: *point,
+                    position: *first,
                     kind: ConnectionKind::WireEndpoint,
                 });
+            }
+            if wire.points.len() > 1 {
+                if let Some(last) = wire.points.last() {
+                    self.connection_points.push(ConnectionPoint {
+                        position: *last,
+                        kind: ConnectionKind::WireEndpoint,
+                    });
+                }
             }
         }
 
@@ -182,39 +193,130 @@ impl ConnectivityGraph {
         }
     }
 
-    /// Connect points that are at the same position (within tolerance)
-    fn connect_nearby_points(&mut self) {
+    /// Connect points at junction positions
+    /// In KiCAD, junctions explicitly mark where wires connect
+    fn connect_at_junctions(&mut self, schematic: &Schematic) {
+        for junction in &schematic.junctions {
+            let jp = junction.position;
+
+            // Find all connection points at this junction position
+            let indices_at_junction: Vec<usize> = self.connection_points
+                .iter()
+                .enumerate()
+                .filter(|(_, cp)| self.points_match(cp.position, jp))
+                .map(|(i, _)| i)
+                .collect();
+
+            // Connect all points at this junction
+            for i in 1..indices_at_junction.len() {
+                self.union(indices_at_junction[0], indices_at_junction[i]);
+            }
+        }
+    }
+
+    /// Connect labels to wire endpoints at the same position
+    fn connect_labels_to_wires(&mut self) {
         let n = self.connection_points.len();
+
+        // Collect all label-to-point connections first
+        let mut connections: Vec<(usize, usize)> = Vec::new();
+
         for i in 0..n {
-            for j in (i + 1)..n {
-                let dist_sq = {
-                    let dx = self.connection_points[i].position.x
-                        - self.connection_points[j].position.x;
-                    let dy = self.connection_points[i].position.y
-                        - self.connection_points[j].position.y;
-                    dx * dx + dy * dy
-                };
-                if dist_sq < Self::TOLERANCE * Self::TOLERANCE {
-                    self.union(i, j);
+            // Only process labels
+            if !matches!(self.connection_points[i].kind, ConnectionKind::Label { .. }) {
+                continue;
+            }
+            let label_pos = self.connection_points[i].position;
+
+            // Find wire endpoints or pins at the same position
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                match &self.connection_points[j].kind {
+                    ConnectionKind::WireEndpoint | ConnectionKind::Pin { .. } => {
+                        let other_pos = self.connection_points[j].position;
+                        let dx = label_pos.x - other_pos.x;
+                        let dy = label_pos.y - other_pos.y;
+                        if dx * dx + dy * dy < Self::TOLERANCE * Self::TOLERANCE {
+                            connections.push((i, j));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Apply all connections
+        for (i, j) in connections {
+            self.union(i, j);
+        }
+    }
+
+    /// Check if two points are at the same position (within floating-point tolerance)
+    fn points_match(&self, p1: Point, p2: Point) -> bool {
+        let dx = p1.x - p2.x;
+        let dy = p1.y - p2.y;
+        dx * dx + dy * dy < Self::TOLERANCE * Self::TOLERANCE
+    }
+
+    /// Connect wire endpoints to pins at the same position, and wire segments together
+    fn connect_wire_segments(&mut self, schematic: &Schematic) {
+        for wire in &schematic.wires {
+            // Get wire start and end positions
+            let start = wire.points.first();
+            let end = wire.points.last();
+
+            // Connect start to any pin at that position
+            if let Some(start_pos) = start {
+                self.connect_point_to_pins(*start_pos);
+            }
+
+            // Connect end to any pin at that position
+            if let Some(end_pos) = end {
+                if wire.points.len() > 1 {
+                    self.connect_point_to_pins(*end_pos);
+                }
+            }
+
+            // Connect start and end of the same wire (they're on the same net)
+            if let (Some(sp), Some(ep)) = (start, end) {
+                if wire.points.len() > 1 {
+                    let idx1 = self.find_point_index(*sp);
+                    let idx2 = self.find_point_index(*ep);
+                    if let (Some(i1), Some(i2)) = (idx1, idx2) {
+                        self.union(i1, i2);
+                    }
                 }
             }
         }
     }
 
-    /// Connect wire segments
-    fn connect_wire_segments(&mut self, schematic: &Schematic) {
-        for wire in &schematic.wires {
-            for i in 0..wire.points.len().saturating_sub(1) {
-                let p1 = wire.points[i];
-                let p2 = wire.points[i + 1];
+    /// Connect a point to any pins at the same position
+    fn connect_point_to_pins(&mut self, pos: Point) {
+        let point_idx = self.find_point_index(pos);
+        if point_idx.is_none() {
+            return;
+        }
+        let point_idx = point_idx.unwrap();
 
-                let idx1 = self.find_point_index(p1);
-                let idx2 = self.find_point_index(p2);
-
-                if let (Some(i1), Some(i2)) = (idx1, idx2) {
-                    self.union(i1, i2);
+        // Find pins at this position (collect indices first to avoid borrow issues)
+        let pin_indices: Vec<usize> = self.connection_points
+            .iter()
+            .enumerate()
+            .filter(|(_, cp)| {
+                matches!(cp.kind, ConnectionKind::Pin { .. }) && {
+                    let dx = cp.position.x - pos.x;
+                    let dy = cp.position.y - pos.y;
+                    dx * dx + dy * dy < Self::TOLERANCE * Self::TOLERANCE
                 }
-            }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // Union all pins at this position with the wire endpoint
+        for pin_idx in pin_indices {
+            self.union(point_idx, pin_idx);
         }
     }
 

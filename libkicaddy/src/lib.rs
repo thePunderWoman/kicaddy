@@ -15,6 +15,7 @@ pub mod schematic;
 pub mod search;
 pub mod symbol;
 pub mod tools;
+pub mod yaml;
 
 // Re-export common types
 pub use config::{ConfigError, KicadConfig};
@@ -23,3 +24,4 @@ pub use symbol::lookup::{find_symbol, LookupError};
 pub use symbol::{parse_symbol_library, parse_symbol_library_str, Symbol, SymbolError, SymbolLibrary};
 pub use search::{build_index, search, IndexStats, SearchError, SearchOptions, SearchResult, SearchResults};
 pub use tools::{Tool, ToolError, ToolMetadata, ToolRegistry};
+pub use yaml::{compile_yaml_file, compile_yaml_str, Compiler as YamlCompiler, YamlError, YamlSchematic, YamlTemplate};

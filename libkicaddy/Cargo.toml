@@ -16,3 +16,4 @@ schemars = "1"
 uuid = { version = "1", features = ["v4"] }
 tantivy = "0.22"
 dirs = "5"
+serde_yaml = "0.9"
