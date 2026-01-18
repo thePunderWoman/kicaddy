@@ -83,6 +83,26 @@ fn parse_library_sexpr(sexpr: &SExpr) -> Result<SymbolLibrary, SymbolError> {
         }
     }
 
+    // Resolve symbol inheritance (extends directive)
+    // Build a map from symbol name to index for efficient lookup
+    let symbol_indices: std::collections::HashMap<String, usize> = symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.clone(), i))
+        .collect();
+
+    // For each symbol that extends another, inherit the parent's units if empty
+    for i in 0..symbols.len() {
+        if let Some(parent_name) = symbols[i].extends.clone() {
+            if let Some(&parent_idx) = symbol_indices.get(&parent_name) {
+                // Clone parent's units if child has none (inheritance)
+                if symbols[i].units.is_empty() {
+                    symbols[i].units = symbols[parent_idx].units.clone();
+                }
+            }
+        }
+    }
+
     Ok(SymbolLibrary {
         version,
         generator,
@@ -103,6 +123,7 @@ fn parse_symbol(sexpr: &SExpr) -> Result<Symbol, SymbolError> {
         .ok_or_else(|| SymbolError::MissingField("symbol name".to_string()))?
         .to_string();
 
+    let mut extends = None;
     let mut pin_numbers_hide = false;
     let mut pin_names_offset = 0.0;
     let mut pin_names_hide = false;
@@ -148,11 +169,14 @@ fn parse_symbol(sexpr: &SExpr) -> Result<Symbol, SymbolError> {
             units.push(parse_symbol_unit(item)?);
         } else if let Some(args) = item.as_list_starting_with("embedded_fonts") {
             embedded_fonts = Some(args.first().and_then(|e| e.as_symbol()) != Some("no"));
+        } else if let Some(args) = item.as_list_starting_with("extends") {
+            extends = args.first().and_then(|e| e.as_string()).map(|s| s.to_string());
         }
     }
 
     Ok(Symbol {
         name,
+        extends,
         pin_numbers_hide,
         pin_names_offset,
         pin_names_hide,

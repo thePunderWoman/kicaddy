@@ -5,16 +5,20 @@
 
 pub mod add_label;
 pub mod add_wire;
+pub mod connect;
 pub mod delete_component;
 pub mod delete_label;
 pub mod delete_wire;
+pub mod disconnect;
 pub mod place_component;
 
 pub use add_label::{AddLabelCommand, LabelLocation};
 pub use add_wire::{AddWireCommand, WireEndpoint};
+pub use connect::{ConnectCommand, ConnectOutput};
 pub use delete_component::DeleteComponentCommand;
 pub use delete_label::DeleteLabelCommand;
 pub use delete_wire::DeleteWireCommand;
+pub use disconnect::{DisconnectCommand, DisconnectOutput};
 pub use place_component::PlaceComponentCommand;
 
 use crate::common::Point;

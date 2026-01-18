@@ -1,3 +1,5 @@
+mod mcp;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -9,6 +11,9 @@ use libkicaddy::commands::{
 use libkicaddy::common::{Point, Position};
 use libkicaddy::parser::sexpr::ToSExpr;
 use libkicaddy::schematic::Schematic;
+use libkicaddy::tools::{
+    OutlineInput, OutlineTool, Tool, UpdateComponentInput, UpdateComponentTool,
+};
 use libkicaddy::{
     build_index, find_symbol, parse_schematic, parse_symbol_library, search, KicadConfig,
     SearchOptions,
@@ -176,6 +181,41 @@ enum Commands {
         #[arg(long)]
         y: Option<f64>,
     },
+    /// Get outline view of schematic (components, pins, nets)
+    Outline {
+        /// Path to the .kicad_sch file
+        schematic: PathBuf,
+        /// Output as JSON (for MCP integration)
+        #[arg(short, long)]
+        json: bool,
+    },
+    /// Update a component's properties (position, angle, reference, value, mirror)
+    UpdateComponent {
+        /// Path to the .kicad_sch file
+        schematic: PathBuf,
+        /// Reference designator of component to update (e.g., "R1")
+        reference: String,
+        /// New X position
+        #[arg(long)]
+        x: Option<f64>,
+        /// New Y position
+        #[arg(long)]
+        y: Option<f64>,
+        /// New rotation angle in degrees
+        #[arg(long)]
+        angle: Option<f64>,
+        /// New reference designator (to rename component)
+        #[arg(long)]
+        new_reference: Option<String>,
+        /// New value
+        #[arg(long)]
+        value: Option<String>,
+        /// Mirror setting: "x", "y", or "none"
+        #[arg(long)]
+        mirror: Option<String>,
+    },
+    /// Start MCP server for AI assistant integration
+    Mcp,
 }
 
 fn main() {
@@ -774,6 +814,116 @@ fn main() {
                     eprintln!("Error writing schematic: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::Outline { schematic, json } => {
+            let input = OutlineInput { schematic };
+            match OutlineTool::execute(input) {
+                Ok(output) => {
+                    if json {
+                        match serde_json::to_string_pretty(&output) {
+                            Ok(json_str) => println!("{}", json_str),
+                            Err(e) => {
+                                eprintln!("Error serializing output: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        // Human-readable output
+                        println!("Schematic Outline");
+                        println!("=================\n");
+
+                        println!(
+                            "Stats: {} components, {} wires, {} nets\n",
+                            output.stats.component_count,
+                            output.stats.wire_count,
+                            output.stats.net_count
+                        );
+
+                        println!("Components:");
+                        for comp in &output.components {
+                            println!(
+                                "  {} ({}) = {}",
+                                comp.reference, comp.lib_id, comp.value
+                            );
+                            println!(
+                                "    Position: ({:.2}, {:.2}), Angle: {}°",
+                                comp.x, comp.y, comp.angle
+                            );
+                            for pin in &comp.pins {
+                                let net_str = pin.net.as_deref().unwrap_or("-");
+                                if pin.name != pin.number && pin.name != "~" {
+                                    println!(
+                                        "    Pin {} ({}): {}",
+                                        pin.number, pin.name, net_str
+                                    );
+                                } else {
+                                    println!("    Pin {}: {}", pin.number, net_str);
+                                }
+                            }
+                        }
+
+                        if !output.nets.is_empty() {
+                            println!("\nNets:");
+                            for net in &output.nets {
+                                let global_marker = if net.is_global { " (global)" } else { "" };
+                                println!("  {}{}: {}", net.name, global_marker, net.connections.join(", "));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::UpdateComponent {
+            schematic,
+            reference,
+            x,
+            y,
+            angle,
+            new_reference,
+            value,
+            mirror,
+        } => {
+            let input = UpdateComponentInput {
+                schematic: schematic.clone(),
+                reference: reference.clone(),
+                x,
+                y,
+                angle,
+                new_reference,
+                value,
+                mirror,
+            };
+
+            match UpdateComponentTool::execute(input) {
+                Ok(output) => {
+                    if output.changes.is_empty() {
+                        println!("No changes made to '{}'", reference);
+                    } else {
+                        println!("Updated '{}' in {}:", output.reference, schematic.display());
+                        for change in &output.changes {
+                            println!("  - {}", change);
+                        }
+                        if output.was_snapped {
+                            println!("  (position snapped to grid)");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Mcp => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            if let Err(e) = rt.block_on(mcp::run_server()) {
+                eprintln!("MCP server error: {}", e);
+                std::process::exit(1);
             }
         }
     }

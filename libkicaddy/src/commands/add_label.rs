@@ -105,6 +105,7 @@ mod tests {
 
         let lib_symbol = Symbol {
             name: "Device:R".to_string(),
+            extends: None,
             pin_numbers_hide: false,
             pin_names_offset: 0.0,
             pin_names_hide: false,

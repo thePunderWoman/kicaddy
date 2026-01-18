@@ -81,6 +81,39 @@ impl Schematic {
         }
     }
 
+    /// Generate the next available reference for a given prefix
+    ///
+    /// # Arguments
+    /// * `prefix` - Reference prefix (e.g., "R", "U", "#PWR")
+    ///
+    /// # Returns
+    /// Next available reference (e.g., "R1", "U3", "#PWR05")
+    pub fn next_reference(&self, prefix: &str) -> String {
+        let mut max_num = 0u32;
+
+        for symbol in &self.symbols {
+            for prop in &symbol.properties {
+                if prop.name == "Reference" {
+                    // Check if this reference starts with our prefix
+                    if prop.value.starts_with(prefix) {
+                        // Extract the numeric suffix
+                        let suffix = &prop.value[prefix.len()..];
+                        if let Ok(num) = suffix.parse::<u32>() {
+                            max_num = max_num.max(num);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Use zero-padded format for power symbols (e.g., #PWR01)
+        if prefix.starts_with('#') {
+            format!("{}{:02}", prefix, max_num + 1)
+        } else {
+            format!("{}{}", prefix, max_num + 1)
+        }
+    }
+
     /// Add a symbol instance to the schematic
     ///
     /// This method:
@@ -91,8 +124,11 @@ impl Schematic {
     /// * `symbol` - The symbol definition from a library
     /// * `lib_id` - Library ID in the format "Library:Symbol" (e.g., "Device:R")
     /// * `position` - Position to place the symbol
-    /// * `reference` - Optional reference designator (e.g., "R1"). If None, uses symbol's default
+    /// * `reference` - Optional reference designator (e.g., "R1"). If None, auto-generates unique one
     /// * `value` - Optional value. If None, uses symbol name
+    ///
+    /// # Returns
+    /// The actual reference designator assigned to the symbol
     pub fn add_symbol(
         &mut self,
         symbol: &Symbol,
@@ -100,7 +136,7 @@ impl Schematic {
         position: Position,
         reference: Option<&str>,
         value: Option<&str>,
-    ) {
+    ) -> String {
         // Add symbol to lib_symbols if not already present
         // lib_symbols uses the lib_id directly (e.g., "Device:R")
         if !self.lib_symbols.iter().any(|s| s.name == lib_id) {
@@ -110,11 +146,20 @@ impl Schematic {
             self.lib_symbols.push(lib_symbol);
         }
 
-        // Determine reference and value
-        let ref_value = reference
-            .map(|s| s.to_string())
-            .or_else(|| symbol.reference().map(|s| format!("{}?", s)))
-            .unwrap_or_else(|| "U?".to_string());
+        // Determine reference - auto-generate unique one if not provided or contains "?"
+        let ref_value = match reference {
+            Some(r) if !r.contains('?') => r.to_string(),
+            Some(r) => {
+                // Reference contains "?" - extract prefix and generate unique ref
+                let prefix = r.trim_end_matches('?');
+                self.next_reference(prefix)
+            }
+            None => {
+                // No reference provided - use symbol's default prefix
+                let prefix = symbol.reference().unwrap_or("U");
+                self.next_reference(prefix)
+            }
+        };
 
         let val_value = value
             .map(|s| s.to_string())
@@ -214,6 +259,8 @@ impl Schematic {
         };
 
         self.symbols.push(instance);
+
+        ref_value
     }
 
     /// Find symbol by reference designator (e.g., "R1", "U1")

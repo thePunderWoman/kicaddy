@@ -248,6 +248,7 @@ fn parse_symbol_from_schematic(sexpr: &SExpr) -> Result<Symbol, String> {
 
     Ok(Symbol {
         name,
+        extends: None, // lib_symbols in schematics are already resolved
         pin_numbers_hide,
         pin_names_offset,
         pin_names_hide,
@@ -1534,6 +1535,7 @@ mod tests {
 
         let lib_symbol = Symbol {
             name: "Test:R".to_string(),
+            extends: None,
             pin_numbers_hide: false,
             pin_names_offset: 0.0,
             pin_names_hide: false,
@@ -1614,6 +1616,7 @@ mod tests {
 
         let lib_symbol = Symbol {
             name: "Test:R".to_string(),
+            extends: None,
             pin_numbers_hide: false,
             pin_names_offset: 0.0,
             pin_names_hide: false,
@@ -1679,6 +1682,7 @@ mod tests {
         // Create a symbol with pins at known positions
         let lib_symbol = Symbol {
             name: "Test:R".to_string(),
+            extends: None,
             pin_numbers_hide: false,
             pin_names_offset: 0.0,
             pin_names_hide: false,

@@ -15,6 +15,7 @@ use libkicaddy::symbol::{
 fn create_resistor_symbol() -> Symbol {
     Symbol {
         name: "R".to_string(),
+        extends: None,
         pin_numbers_hide: false,
         pin_names_offset: 0.0,
         pin_names_hide: true,
@@ -137,8 +138,8 @@ fn test_place_component_auto_reference() {
 
     let result = cmd.execute(&mut schematic).unwrap();
 
-    // Should use symbol's reference property + "?"
-    assert_eq!(result.reference, "R?");
+    // Should auto-generate unique reference starting from R1
+    assert_eq!(result.reference, "R1");
 }
 
 #[test]

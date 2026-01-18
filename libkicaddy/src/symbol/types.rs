@@ -26,6 +26,8 @@ pub struct SymbolLibrary {
 pub struct Symbol {
     /// Symbol name/identifier
     pub name: String,
+    /// Parent symbol name for inheritance (via `extends` directive)
+    pub extends: Option<String>,
     /// Whether to hide pin numbers
     pub pin_numbers_hide: bool,
     /// Pin name offset

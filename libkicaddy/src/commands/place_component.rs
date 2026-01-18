@@ -42,15 +42,8 @@ impl Command for PlaceComponentCommand {
 
         let snapped_position = Position::new(snapped_x, snapped_y, self.position.angle);
 
-        // Determine the reference that will be used
-        let reference = self
-            .reference
-            .clone()
-            .or_else(|| self.symbol.reference().map(|s| format!("{}?", s)))
-            .unwrap_or_else(|| "U?".to_string());
-
-        // Add the symbol to the schematic
-        schematic.add_symbol(
+        // Add the symbol to the schematic and get the actual reference assigned
+        let reference = schematic.add_symbol(
             &self.symbol,
             &self.lib_id,
             snapped_position,
@@ -75,6 +68,7 @@ mod tests {
     fn create_test_symbol() -> Symbol {
         Symbol {
             name: "R".to_string(),
+            extends: None,
             pin_numbers_hide: false,
             pin_names_offset: 0.0,
             pin_names_hide: false,
@@ -152,8 +146,8 @@ mod tests {
 
         let result = cmd.execute(&mut schematic).unwrap();
 
-        // Should use symbol's reference property with "?"
-        assert_eq!(result.reference, "R?");
+        // Should auto-generate unique reference starting from R1
+        assert_eq!(result.reference, "R1");
     }
 
     #[test]
