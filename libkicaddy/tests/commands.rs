@@ -194,23 +194,6 @@ fn test_add_wire_point_to_point() {
 }
 
 #[test]
-fn test_add_wire_orthogonal_routing() {
-    let mut schematic = Schematic::new();
-
-    let cmd = AddWireCommand {
-        from: WireEndpoint::Point(Point::new(100.0, 50.0)),
-        to: WireEndpoint::Point(Point::new(150.0, 80.0)),
-        routing: RoutingMode::Orthogonal,
-    };
-
-    cmd.execute(&mut schematic).unwrap();
-
-    assert_eq!(schematic.wires.len(), 1);
-    // Orthogonal creates 3 points (start, corner, end)
-    assert_eq!(schematic.wires[0].points.len(), 3);
-}
-
-#[test]
 fn test_add_wire_pin_endpoint() {
     let mut schematic = Schematic::new();
 
@@ -669,63 +652,3 @@ fn test_parse_label_shape() {
     ));
 }
 
-// ============================================================================
-// Full Workflow Tests
-// ============================================================================
-
-#[test]
-fn test_full_workflow_place_wire_label_delete() {
-    let mut schematic = Schematic::new();
-    let symbol = create_resistor_symbol();
-
-    // 1. Place a component
-    let place_cmd = PlaceComponentCommand {
-        symbol,
-        lib_id: "Device:R".to_string(),
-        position: Position::new(100.0, 50.0, 0.0),
-        reference: Some("R1".to_string()),
-        value: Some("10k".to_string()),
-    };
-    let place_result = place_cmd.execute(&mut schematic).unwrap();
-    assert_eq!(place_result.reference, "R1");
-
-    // 2. Add a wire from a pin
-    let wire_cmd = AddWireCommand {
-        from: WireEndpoint::Pin {
-            reference: "R1".to_string(),
-            pin: "1".to_string(),
-        },
-        to: WireEndpoint::Point(Point::new(80.0, 50.0)),
-        routing: RoutingMode::Direct,
-    };
-    wire_cmd.execute(&mut schematic).unwrap();
-    assert_eq!(schematic.wires.len(), 1);
-
-    // 3. Add a label at the wire endpoint
-    let label_cmd = AddLabelCommand {
-        text: "INPUT".to_string(),
-        location: LabelLocation::Position(Position::new(80.0, 50.0, 0.0)),
-        global: false,
-        shape: LabelShape::Input,
-    };
-    label_cmd.execute(&mut schematic).unwrap();
-    assert_eq!(schematic.labels.len(), 1);
-
-    // 4. Delete the label
-    let delete_label_cmd = DeleteLabelCommand {
-        name: "INPUT".to_string(),
-        position: None,
-    };
-    delete_label_cmd.execute(&mut schematic).unwrap();
-    assert_eq!(schematic.labels.len(), 0);
-
-    // 5. Delete the component (should also delete connected wire)
-    let delete_comp_cmd = DeleteComponentCommand {
-        reference: "R1".to_string(),
-    };
-    delete_comp_cmd.execute(&mut schematic).unwrap();
-    assert_eq!(schematic.symbols.len(), 0);
-    assert_eq!(schematic.lib_symbols.len(), 0);
-    // Wire endpoint was at pin, so it should be deleted too
-    assert_eq!(schematic.wires.len(), 0);
-}

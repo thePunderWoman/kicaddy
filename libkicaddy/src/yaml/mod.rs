@@ -56,7 +56,7 @@ mod types;
 mod validation;
 
 // Re-export public types
-pub use compiler::{compile_yaml_file, compile_yaml_str, CompileOutput, Compiler};
+pub use compiler::{compile_yaml_file, compile_yaml_str, CompileOutput, Compiler, LayoutInfo, LayoutOutput};
 pub use error::YamlError;
 pub use types::{ComponentDef, Connection, Group, Meta, Position2D, YamlSchematic, YamlTemplate};
 pub use validation::{validate, validate_deep, ValidationResult};

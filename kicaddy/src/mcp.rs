@@ -188,6 +188,14 @@ pub struct NetlistRequest {
     pub filter: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetSymbolInfoRequest {
+    /// Library name (e.g., 'Device', 'Connector', 'Espressif')
+    pub library: String,
+    /// Symbol name within the library (e.g., 'R', 'C', 'ESP32-C6-WROOM-1')
+    pub symbol: String,
+}
+
 // ============================================================================
 // Output Types for YAML tools
 // ============================================================================
@@ -211,7 +219,7 @@ struct MetaInfo {
 struct ComponentInfo {
     reference: String,
     symbol: String,
-    position: [f64; 2],
+    position: Option<[f64; 2]>,
     angle: f64,
     value: Option<String>,
     group: Option<String>,
@@ -222,6 +230,48 @@ struct ConnectionInfo {
     net: Option<String>,
     pins: Vec<String>,
     global: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SymbolInfoOutput {
+    /// Full lib_id (e.g., "Device:R")
+    lib_id: String,
+    /// Symbol name
+    name: String,
+    /// Library name
+    library: String,
+    /// Description (from Description property)
+    description: Option<String>,
+    /// Datasheet URL (from Datasheet property)
+    datasheet: Option<String>,
+    /// Default footprint (from Footprint property)
+    footprint: Option<String>,
+    /// Keywords for searching
+    keywords: Option<String>,
+    /// Reference designator prefix (e.g., "R", "C", "U")
+    reference_prefix: Option<String>,
+    /// Default value
+    default_value: Option<String>,
+    /// Number of units (for multi-unit symbols)
+    unit_count: usize,
+    /// List of pins
+    pins: Vec<PinInfoOutput>,
+    /// Include in BOM
+    in_bom: bool,
+    /// Include on board
+    on_board: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PinInfoOutput {
+    /// Pin number (what you use in connections, e.g., "1", "2", "VCC")
+    number: String,
+    /// Pin name (descriptive, e.g., "~", "VCC", "GND")
+    name: String,
+    /// Electrical type (input, output, passive, power_in, etc.)
+    electrical_type: String,
+    /// Whether the pin is hidden
+    hidden: bool,
 }
 
 
@@ -306,7 +356,7 @@ fn execute_outline(yaml_path: &str) -> Result<String, String> {
         components.push(ComponentInfo {
             reference: reference.clone(),
             symbol: comp.symbol.clone(),
-            position: [comp.position.x(), comp.position.y()],
+            position: comp.position.as_ref().map(|p| [p.x(), p.y()]),
             angle: comp.angle,
             value: comp.value.clone(),
             group: None,
@@ -320,7 +370,7 @@ fn execute_outline(yaml_path: &str) -> Result<String, String> {
             components.push(ComponentInfo {
                 reference: reference.clone(),
                 symbol: comp.symbol.clone(),
-                position: [comp.position.x(), comp.position.y()],
+                position: comp.position.as_ref().map(|p| [p.x(), p.y()]),
                 angle: comp.angle,
                 value: comp.value.clone(),
                 group: Some(group_name.clone()),
@@ -501,6 +551,76 @@ fn execute_search_symbol(query: &str, limit: Option<usize>, library: Option<&str
     }
 }
 
+fn execute_get_symbol_info(library: &str, symbol: &str) -> Result<String, String> {
+    use libkicaddy::symbol::lookup::find_symbol;
+    use libkicaddy::KicadConfig;
+
+    let config = KicadConfig::detect()
+        .map_err(|e| format!("Config error: {}", e))?;
+
+    let sym = find_symbol(&config, library, symbol)
+        .map_err(|e| format!("{}", e))?;
+
+    // Collect all pins from all units, deduplicating by pin number
+    let mut seen_pins = std::collections::HashSet::new();
+    let mut pins: Vec<PinInfoOutput> = Vec::new();
+
+    for pin in sym.pins() {
+        if seen_pins.insert(pin.number.number.clone()) {
+            pins.push(PinInfoOutput {
+                number: pin.number.number.clone(),
+                name: pin.name.name.clone(),
+                electrical_type: pin.electrical_type.as_str().to_string(),
+                hidden: pin.hide,
+            });
+        }
+    }
+
+    // Sort pins: numeric pins first (sorted numerically), then alphanumeric
+    pins.sort_by(|a, b| {
+        let a_num: Option<i32> = a.number.parse().ok();
+        let b_num: Option<i32> = b.number.parse().ok();
+        match (a_num, b_num) {
+            (Some(an), Some(bn)) => an.cmp(&bn),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.number.cmp(&b.number),
+        }
+    });
+
+    // Count unique units (excluding style variants like _0_1, _1_1)
+    let unit_count = sym.units.iter()
+        .filter(|u| u.name.ends_with("_1"))
+        .count()
+        .max(1);
+
+    // Get datasheet URL, filtering out placeholder values
+    let datasheet = sym.property("Datasheet")
+        .map(|p| p.value.as_str())
+        .filter(|v| !v.is_empty() && *v != "~" && !v.starts_with("${"))
+        .map(|s| s.to_string());
+
+    let output = SymbolInfoOutput {
+        lib_id: format!("{}:{}", library, symbol),
+        name: sym.name.clone(),
+        library: library.to_string(),
+        description: sym.description().map(|s| s.to_string()),
+        datasheet,
+        footprint: sym.footprint()
+            .filter(|v| !v.is_empty() && *v != "~")
+            .map(|s| s.to_string()),
+        keywords: sym.keywords().map(|s| s.to_string()),
+        reference_prefix: sym.reference().map(|s| s.to_string()),
+        default_value: sym.value().map(|s| s.to_string()),
+        unit_count,
+        pins,
+        in_bom: sym.in_bom,
+        on_board: sym.on_board,
+    };
+
+    serde_json::to_string_pretty(&output).map_err(|e| e.to_string())
+}
+
 // ============================================================================
 // MCP Server Handler
 // ============================================================================
@@ -532,7 +652,11 @@ impl ServerHandler for KicaddyService {
                 tools: vec![
                     make_tool::<SearchSymbolRequest>(
                         "search_symbol",
-                        "Search KiCAD symbol libraries by keyword. Returns lib_id (e.g., 'Device:R') and pin information for use in YAML schematics.",
+                        "Search KiCAD symbol libraries by keyword. Returns lib_id (e.g., 'Device:R') and basic info for use in YAML schematics.",
+                    ),
+                    make_tool::<GetSymbolInfoRequest>(
+                        "get_symbol_info",
+                        "Get detailed information about a specific symbol including all pins, datasheet URL, footprint, and description.",
                     ),
                     empty_tool(
                         "get_config",
@@ -576,6 +700,12 @@ impl ServerHandler for KicaddyService {
                     let req: SearchSymbolRequest = serde_json::from_value(args_value)
                         .map_err(|e| rmcp::ErrorData::invalid_params(format!("Invalid params: {}", e), None))?;
                     execute_search_symbol(&req.query, req.limit, req.library.as_deref())
+                        .unwrap_or_else(|e| format!("Error: {}", e))
+                }
+                "get_symbol_info" => {
+                    let req: GetSymbolInfoRequest = serde_json::from_value(args_value)
+                        .map_err(|e| rmcp::ErrorData::invalid_params(format!("Invalid params: {}", e), None))?;
+                    execute_get_symbol_info(&req.library, &req.symbol)
                         .unwrap_or_else(|e| format!("Error: {}", e))
                 }
                 "get_config" => {

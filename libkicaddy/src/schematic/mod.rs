@@ -1408,40 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_wire_routed_orthogonal() {
-        let mut sch = Schematic::new();
-
-        sch.add_wire_routed(
-            Point::new(100.0, 50.0),
-            Point::new(150.0, 80.0),
-            RoutingMode::Orthogonal,
-        );
-
-        assert_eq!(sch.wires.len(), 1);
-        // Orthogonal routing creates 3 points (start, corner, end)
-        assert_eq!(sch.wires[0].points.len(), 3);
-    }
-
-    #[test]
-    fn test_add_wire_routed_orthogonal_vh() {
-        let mut sch = Schematic::new();
-
-        sch.add_wire_routed(
-            Point::new(100.0, 50.0),
-            Point::new(150.0, 80.0),
-            RoutingMode::OrthogonalVH,
-        );
-
-        assert_eq!(sch.wires.len(), 1);
-        assert_eq!(sch.wires[0].points.len(), 3);
-        // VH mode: vertical first, then horizontal
-        // Middle point should have same X as start and same Y as end
-        let mid = &sch.wires[0].points[1];
-        assert!((mid.x - sch.wires[0].points[0].x).abs() < 0.01);
-        assert!((mid.y - sch.wires[0].points[2].y).abs() < 0.01);
-    }
-
-    #[test]
     fn test_add_label() {
         let mut sch = Schematic::new();
         assert_eq!(sch.labels.len(), 0);

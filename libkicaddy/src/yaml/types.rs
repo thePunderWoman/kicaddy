@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::layout::LayoutConfig;
+
 /// Root structure for a YAML schematic definition
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct YamlSchematic {
@@ -49,6 +51,10 @@ pub struct Meta {
     /// Company
     #[serde(default)]
     pub company: Option<String>,
+
+    /// Layout configuration for automatic component positioning
+    #[serde(default)]
+    pub layout: Option<LayoutConfig>,
 }
 
 fn default_paper() -> String {
@@ -73,8 +79,9 @@ pub struct ComponentDef {
     /// Symbol in Library:Symbol format (e.g., "Device:R", "Regulator_Linear:AP2112K-3.3")
     pub symbol: String,
 
-    /// Position as [x, y] or {x: _, y: _}
-    pub position: Position2D,
+    /// Position as [x, y] or {x: _, y: _}. Optional - if omitted, auto-layout will be used.
+    #[serde(default)]
+    pub position: Option<Position2D>,
 
     /// Rotation angle in degrees (0, 90, 180, 270)
     #[serde(default)]
@@ -343,8 +350,9 @@ components:
 "#;
         let sch1 = YamlSchematic::from_str(yaml1).unwrap();
         let r1 = sch1.components.get("R1").unwrap();
-        assert_eq!(r1.position.x(), 100.0);
-        assert_eq!(r1.position.y(), 50.0);
+        let pos1 = r1.position.as_ref().unwrap();
+        assert_eq!(pos1.x(), 100.0);
+        assert_eq!(pos1.y(), 50.0);
 
         // Object format
         let yaml2 = r#"
@@ -357,8 +365,23 @@ components:
 "#;
         let sch2 = YamlSchematic::from_str(yaml2).unwrap();
         let r2 = sch2.components.get("R2").unwrap();
-        assert_eq!(r2.position.x(), 200.0);
-        assert_eq!(r2.position.y(), 75.0);
+        let pos2 = r2.position.as_ref().unwrap();
+        assert_eq!(pos2.x(), 200.0);
+        assert_eq!(pos2.y(), 75.0);
+    }
+
+    #[test]
+    fn test_position_optional() {
+        // No position specified - should parse successfully
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    value: 10k
+"#;
+        let schematic = YamlSchematic::from_str(yaml).unwrap();
+        let r1 = schematic.components.get("R1").unwrap();
+        assert!(r1.position.is_none());
     }
 
     #[test]

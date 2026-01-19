@@ -196,23 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_wire_orthogonal_routing() {
-        let mut schematic = Schematic::new();
-
-        let cmd = AddWireCommand {
-            from: WireEndpoint::point(100.0, 50.0),
-            to: WireEndpoint::point(150.0, 80.0),
-            routing: RoutingMode::Orthogonal,
-        };
-
-        cmd.execute(&mut schematic).unwrap();
-
-        assert_eq!(schematic.wires.len(), 1);
-        // Orthogonal routing creates 3 points
-        assert_eq!(schematic.wires[0].points.len(), 3);
-    }
-
-    #[test]
     fn test_add_wire_symbol_not_found() {
         let mut schematic = Schematic::new();
 

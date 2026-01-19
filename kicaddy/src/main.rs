@@ -97,6 +97,13 @@ enum Commands {
         #[arg(short, long)]
         json: bool,
     },
+    /// Get detailed information about a symbol
+    SymbolInfo {
+        /// Library name (e.g., "Device")
+        library: String,
+        /// Symbol name (e.g., "R")
+        symbol: String,
+    },
     /// Add a wire connection to a schematic
     AddWire {
         /// Path to the .kicad_sch file
@@ -234,6 +241,19 @@ enum Commands {
         /// Template to use: basic, regulator, led (default: basic)
         #[arg(short, long, default_value = "basic")]
         template: String,
+    },
+    /// Print computed layout positions (for debugging layout algorithm)
+    PrintLayout {
+        /// Path to the YAML schematic definition file
+        yaml: PathBuf,
+    },
+    /// Show netlist from a YAML schematic (which pins connect to which nets)
+    Netlist {
+        /// Path to the YAML schematic definition file
+        yaml: PathBuf,
+        /// Filter to show only connections for a specific component (e.g., 'U1')
+        #[arg(short, long)]
+        filter: Option<String>,
     },
 }
 
@@ -519,6 +539,66 @@ fn main() {
                                 println!();
                             }
                         }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::SymbolInfo { library, symbol } => {
+            let config = match KicadConfig::detect() {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            match find_symbol(&config, &library, &symbol) {
+                Ok(sym) => {
+                    println!("Symbol: {}:{}", library, symbol);
+                    println!("Reference: {}", sym.reference().unwrap_or("?"));
+                    if let Some(desc) = sym.description() {
+                        println!("Description: {}", desc);
+                    }
+                    if let Some(ds) = sym.property("Datasheet").map(|p| &p.value).filter(|v| !v.is_empty() && *v != "~") {
+                        println!("Datasheet: {}", ds);
+                    }
+                    if let Some(fp) = sym.footprint().filter(|v| !v.is_empty() && *v != "~") {
+                        println!("Footprint: {}", fp);
+                    }
+                    if let Some(kw) = sym.keywords() {
+                        println!("Keywords: {}", kw);
+                    }
+
+                    // Collect unique pins
+                    let mut seen = std::collections::HashSet::new();
+                    let mut pins: Vec<_> = sym.pins()
+                        .filter(|p| seen.insert(p.number.number.clone()))
+                        .collect();
+
+                    // Sort pins
+                    pins.sort_by(|a, b| {
+                        let an: Option<i32> = a.number.number.parse().ok();
+                        let bn: Option<i32> = b.number.number.parse().ok();
+                        match (an, bn) {
+                            (Some(a), Some(b)) => a.cmp(&b),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.number.number.cmp(&b.number.number),
+                        }
+                    });
+
+                    println!("\nPins ({}):", pins.len());
+                    for pin in &pins {
+                        let name_str = if pin.name.name.is_empty() || pin.name.name == "~" {
+                            "".to_string()
+                        } else {
+                            format!(" ({})", pin.name.name)
+                        };
+                        println!("  {:>4}{:<20} {}", pin.number.number, name_str, pin.electrical_type.as_str());
                     }
                 }
                 Err(e) => {
@@ -1040,6 +1120,153 @@ fn main() {
                 Err(e) => {
                     eprintln!("Error writing file: {}", e);
                     std::process::exit(1);
+                }
+            }
+        }
+        Commands::PrintLayout { yaml } => {
+            // Parse the YAML file
+            let yaml_sch = match YamlSchematic::from_file(&yaml) {
+                Ok(sch) => sch,
+                Err(e) => {
+                    eprintln!("Error parsing YAML: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Create the compiler
+            let compiler = match libkicaddy::yaml::Compiler::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Get layout info
+            match compiler.get_layout_info(&yaml_sch) {
+                Ok(output) => {
+                    // Print header
+                    println!("Layout Debug Output");
+                    println!("==================\n");
+
+                    // Print table header
+                    println!(
+                        "{:<12} {:>18} {:>14} {:>12}",
+                        "Component", "Position (mils)", "Size (mils)", "Group"
+                    );
+                    println!(
+                        "{:<12} {:>18} {:>14} {:>12}",
+                        "---------", "---------------", "-----------", "-----"
+                    );
+
+                    // Print each component
+                    for comp in &output.components {
+                        let pos_str = format!("({}, {})", comp.position_mils.0, comp.position_mils.1);
+                        let size_str = format!("{} x {}", comp.size_mils.0, comp.size_mils.1);
+                        let group_str = comp.group.as_deref().unwrap_or("-");
+                        let fixed_marker = if comp.fixed { " *" } else { "" };
+                        println!(
+                            "{:<12} {:>18} {:>14} {:>12}{}",
+                            comp.reference, pos_str, size_str, group_str, fixed_marker
+                        );
+                    }
+
+                    // Print overlap check
+                    println!();
+                    if output.overlaps.is_empty() {
+                        println!("Overlap check: OK (no overlaps)");
+                    } else {
+                        println!("Overlap check: FAILED ({} overlaps)", output.overlaps.len());
+                        for (a, b) in &output.overlaps {
+                            println!("  - {} overlaps with {}", a, b);
+                        }
+                    }
+
+                    // Print bounding box
+                    let (min_x, min_y, max_x, max_y) = output.bounding_box_mils;
+                    let width = max_x - min_x;
+                    let height = max_y - min_y;
+                    println!(
+                        "Bounding box: ({}, {}) to ({}, {}) [{} x {} mils]",
+                        min_x, min_y, max_x, max_y, width, height
+                    );
+
+                    // Print paper bounds
+                    println!(
+                        "Paper bounds: (0, 0) to ({}, {}) [{} landscape]",
+                        output.paper_mils.0, output.paper_mils.1, output.paper_name
+                    );
+
+                    // Print legend
+                    println!("\n* = position specified in YAML (fixed)");
+                }
+                Err(e) => {
+                    eprintln!("Error computing layout: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Netlist { yaml, filter } => {
+            // Parse the YAML file
+            let yaml_sch = match YamlSchematic::from_file(&yaml) {
+                Ok(sch) => sch,
+                Err(e) => {
+                    eprintln!("Error parsing YAML: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let all_connections = yaml_sch.all_connections();
+
+            // Build net map: net_name -> pins
+            let mut named_nets: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut anonymous_connections: Vec<Vec<String>> = Vec::new();
+
+            for conn in &all_connections {
+                let pins: Vec<String> = conn
+                    .pins
+                    .iter()
+                    .filter(|p| {
+                        if let Some(ref f) = filter {
+                            p.starts_with(f)
+                                && p.chars().nth(f.len()).map(|c| c == ':').unwrap_or(false)
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+
+                if pins.is_empty() && filter.is_some() {
+                    continue;
+                }
+
+                if let Some(ref net_name) = conn.net {
+                    named_nets.entry(net_name.clone()).or_default().extend(pins);
+                } else if pins.len() >= 2 {
+                    anonymous_connections.push(pins);
+                }
+            }
+
+            // Print named nets
+            let mut net_names: Vec<_> = named_nets.keys().cloned().collect();
+            net_names.sort();
+
+            if net_names.is_empty() && anonymous_connections.is_empty() {
+                println!("No connections defined");
+            } else {
+                for name in net_names {
+                    if let Some(pins) = named_nets.get(&name) {
+                        if !pins.is_empty() {
+                            println!("&{}: {}", name, pins.join(", "));
+                        }
+                    }
+                }
+
+                // Print anonymous connections (direct wires)
+                for pins in &anonymous_connections {
+                    println!("{}", pins.join(" - "));
                 }
             }
         }

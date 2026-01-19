@@ -10,6 +10,7 @@ pub mod commands;
 pub mod common;
 pub mod config;
 pub mod connectivity;
+pub mod layout;
 pub mod parser;
 pub mod schematic;
 pub mod search;
