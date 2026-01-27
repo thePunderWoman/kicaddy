@@ -50,6 +50,9 @@ impl ForceDirectedLayout {
             temperature *= self.config.cooling_factor;
         }
 
+        // Enforce minimum spacing as hard constraint
+        self.enforce_minimum_spacing(graph);
+
         // Center the layout on the paper (for layouts that are within bounds)
         self.center_on_paper(graph, paper_width, paper_height);
 
@@ -415,6 +418,72 @@ impl ForceDirectedLayout {
         }
     }
 
+    /// Enforce minimum spacing between all node pairs as a hard constraint.
+    /// This is a post-processing step to catch any spacing violations that
+    /// the force simulation didn't fully resolve.
+    fn enforce_minimum_spacing(&self, graph: &mut LayoutGraph) {
+        let max_passes = 50;
+        let min_spacing = self.config.min_spacing;
+
+        for _pass in 0..max_passes {
+            let mut any_violation = false;
+            let refs: Vec<String> = graph.nodes.keys().cloned().collect();
+
+            for i in 0..refs.len() {
+                for j in (i + 1)..refs.len() {
+                    // Skip if either node is fixed
+                    let node_i_fixed = graph.get_node(&refs[i]).map(|n| n.fixed).unwrap_or(true);
+                    let node_j_fixed = graph.get_node(&refs[j]).map(|n| n.fixed).unwrap_or(true);
+
+                    if node_i_fixed && node_j_fixed {
+                        continue;
+                    }
+
+                    // Check for spacing violation
+                    let separation = {
+                        let node_i = graph.get_node(&refs[i]).unwrap();
+                        let node_j = graph.get_node(&refs[j]).unwrap();
+                        node_i.separation_from(node_j, min_spacing)
+                    };
+
+                    if let Some((overlap_depth, sep_dir)) = separation {
+                        any_violation = true;
+
+                        // Push nodes apart - split the movement if both can move
+                        let move_i = !node_i_fixed;
+                        let move_j = !node_j_fixed;
+                        let push_each = if move_i && move_j {
+                            (overlap_depth / 2.0) + 0.1 // Add small buffer
+                        } else {
+                            overlap_depth + 0.1
+                        };
+
+                        // Apply movement
+                        if move_i {
+                            if let Some(node) = graph.get_node_mut(&refs[i]) {
+                                node.position.x += sep_dir.x * push_each;
+                                node.position.y += sep_dir.y * push_each;
+                                node.position.x = snap_to_grid(node.position.x);
+                                node.position.y = snap_to_grid(node.position.y);
+                            }
+                        }
+                        if move_j {
+                            if let Some(node) = graph.get_node_mut(&refs[j]) {
+                                node.position.x -= sep_dir.x * push_each;
+                                node.position.y -= sep_dir.y * push_each;
+                                node.position.x = snap_to_grid(node.position.x);
+                                node.position.y = snap_to_grid(node.position.y);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !any_violation {
+                break;
+            }
+        }
+    }
 }
 
 impl Default for ForceDirectedLayout {
@@ -657,6 +726,78 @@ mod tests {
             d12,
             d23,
             d13
+        );
+    }
+
+    #[test]
+    fn test_minimum_spacing_enforced() {
+        use crate::layout::config::LayoutConfig;
+
+        let mut graph = LayoutGraph::new();
+
+        // Create a custom config with specific min_spacing for testing
+        let config = LayoutConfig {
+            min_spacing: 15.0, // 15mm minimum gap
+            ..Default::default()
+        };
+
+        // Two nodes placed very close together (overlapping considering size + spacing)
+        // Each node is 10mm wide, so with 15mm spacing requirement,
+        // they need 10/2 + 15 + 10/2 = 25mm center-to-center minimum
+        graph.add_node(make_test_node("C1", 100.0, 100.0, false));
+        graph.add_node(make_test_node("C2", 105.0, 100.0, false)); // Only 5mm apart
+
+        let layout = ForceDirectedLayout::with_config(config);
+        layout.layout(&mut graph);
+
+        let c1 = graph.get_node("C1").unwrap();
+        let c2 = graph.get_node("C2").unwrap();
+
+        // Calculate the gap between the two nodes
+        let gap = c1.gap_from(c2);
+
+        // Gap should be at least min_spacing (15mm), allowing small tolerance for grid snapping
+        assert!(
+            gap >= 14.0,
+            "Minimum spacing not enforced: gap = {}mm (expected >= 15mm)",
+            gap
+        );
+    }
+
+    #[test]
+    fn test_minimum_spacing_with_fixed_node() {
+        use crate::layout::config::LayoutConfig;
+
+        let mut graph = LayoutGraph::new();
+
+        let config = LayoutConfig {
+            min_spacing: 15.0,
+            ..Default::default()
+        };
+
+        // Fixed node at a specific position (grid-aligned)
+        graph.add_node(make_test_node("C1", 100.33, 100.33, true)); // Fixed
+        graph.add_node(make_test_node("C2", 105.41, 100.33, false)); // Movable, too close
+
+        let layout = ForceDirectedLayout::with_config(config);
+        layout.layout(&mut graph);
+
+        let c1 = graph.get_node("C1").unwrap();
+        let c2 = graph.get_node("C2").unwrap();
+
+        // C1 should not have moved (it's fixed)
+        assert!(
+            (c1.position.x - 100.33).abs() < 0.01,
+            "Fixed node C1 moved: {}",
+            c1.position.x
+        );
+
+        // Gap should still be enforced (C2 moved away)
+        let gap = c1.gap_from(c2);
+        assert!(
+            gap >= 14.0,
+            "Minimum spacing not enforced with fixed node: gap = {}mm",
+            gap
         );
     }
 }

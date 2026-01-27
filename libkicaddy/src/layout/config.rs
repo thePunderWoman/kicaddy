@@ -94,15 +94,15 @@ impl Default for LayoutConfig {
 }
 
 fn default_iterations() -> usize {
-    100
+    200
 }
 
 fn default_temperature() -> f64 {
-    50.0 // mm
+    100.0 // mm - allow larger initial movements
 }
 
 fn default_cooling() -> f64 {
-    0.95
+    0.97
 }
 
 fn default_ideal_distance() -> f64 {
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = LayoutConfig::default();
-        assert_eq!(config.iterations, 100);
+        assert_eq!(config.iterations, 200);
         assert!(config.initial_temperature > 0.0);
         assert!(config.cooling_factor > 0.0 && config.cooling_factor < 1.0);
     }

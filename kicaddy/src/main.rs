@@ -255,6 +255,14 @@ enum Commands {
         #[arg(short, long)]
         filter: Option<String>,
     },
+    /// Generate a bill of materials from a YAML schematic
+    Bom {
+        /// Path to the YAML schematic definition file
+        yaml: PathBuf,
+        /// Don't group by value (show all instances of same symbol together)
+        #[arg(long)]
+        no_group_by_value: bool,
+    },
 }
 
 fn main() {
@@ -1269,6 +1277,99 @@ fn main() {
                     println!("{}", pins.join(" - "));
                 }
             }
+        }
+        Commands::Bom { yaml, no_group_by_value } => {
+            // Parse the YAML file
+            let yaml_sch = match YamlSchematic::from_file(&yaml) {
+                Ok(sch) => sch,
+                Err(e) => {
+                    eprintln!("Error parsing YAML: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let all_components = yaml_sch.all_components();
+            let group_by_value = !no_group_by_value;
+
+            // Group components by symbol (and optionally value)
+            // Key: (symbol, value) or (symbol, "") if not grouping by value
+            let mut groups: std::collections::HashMap<(String, String), Vec<String>> =
+                std::collections::HashMap::new();
+
+            for (reference, component) in &all_components {
+                let value = if group_by_value {
+                    component.value.clone().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let key = (component.symbol.clone(), value);
+                groups.entry(key).or_default().push(reference.clone());
+            }
+
+            // Sort references within each group
+            for refs in groups.values_mut() {
+                refs.sort_by(|a, b| {
+                    // Natural sort: extract prefix and number
+                    let parse_ref = |r: &str| -> (String, i32) {
+                        let prefix: String = r.chars().take_while(|c| !c.is_ascii_digit()).collect();
+                        let num: i32 = r.chars().skip_while(|c| !c.is_ascii_digit())
+                            .collect::<String>().parse().unwrap_or(0);
+                        (prefix, num)
+                    };
+                    parse_ref(a).cmp(&parse_ref(b))
+                });
+            }
+
+            // Sort groups by symbol name, then value
+            let mut sorted_groups: Vec<_> = groups.into_iter().collect();
+            sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // Print BOM header
+            println!("Bill of Materials");
+            println!("=================\n");
+
+            if let Some(ref title) = yaml_sch.meta.title {
+                println!("Project: {}", title);
+            }
+            if let Some(ref rev) = yaml_sch.meta.revision {
+                println!("Revision: {}", rev);
+            }
+            if yaml_sch.meta.title.is_some() || yaml_sch.meta.revision.is_some() {
+                println!();
+            }
+
+            // Print table header
+            println!(
+                "{:>4}  {:<40} {:<15} {}",
+                "Qty", "Description", "Value", "References"
+            );
+            println!(
+                "{:>4}  {:<40} {:<15} {}",
+                "---", "-----------", "-----", "----------"
+            );
+
+            let mut total_count = 0;
+            for ((symbol, value), refs) in &sorted_groups {
+                let qty = refs.len();
+                total_count += qty;
+
+                // Format references, abbreviating long lists
+                let refs_str = if refs.len() <= 5 {
+                    refs.join(", ")
+                } else {
+                    format!("{}, ... ({} total)", refs[..3].join(", "), refs.len())
+                };
+
+                let value_str = if value.is_empty() { "-" } else { value.as_str() };
+
+                println!(
+                    "{:>4}  {:<40} {:<15} {}",
+                    qty, symbol, value_str, refs_str
+                );
+            }
+
+            println!();
+            println!("Total: {} components in {} line items", total_count, sorted_groups.len());
         }
     }
 }

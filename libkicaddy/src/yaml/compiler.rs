@@ -192,9 +192,9 @@ impl Compiler {
                 node = node.with_group(Some(group_name.clone()));
             }
 
-            // If position is specified, mark as fixed
+            // If position is specified, use as starting position (not fixed, can be adjusted)
             if let Some(ref pos) = component.position {
-                node = node.with_position(pos.x(), pos.y()).with_fixed(true);
+                node = node.with_position(pos.x(), pos.y());
             }
 
             // Add pin information
@@ -454,9 +454,9 @@ impl Compiler {
                 node = node.with_group(Some(group_name.clone()));
             }
 
-            // If position is specified, mark as fixed
+            // If position is specified, use as starting position (not fixed, can be adjusted)
             if let Some(ref pos) = component.position {
-                node = node.with_position(pos.x(), pos.y()).with_fixed(true);
+                node = node.with_position(pos.x(), pos.y());
             }
 
             // Add pin information
