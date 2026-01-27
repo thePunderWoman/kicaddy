@@ -111,6 +111,15 @@ impl NetType {
     }
 }
 
+/// What a merged passive component connects to on its "other" side
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergedTarget {
+    /// Connected to a net (power, ground, or signal)
+    Net(String),
+    /// Connected to a single component pin
+    Pin { reference: String, pin: String },
+}
+
 /// A semantic connection endpoint
 #[derive(Debug, Clone, PartialEq)]
 pub enum SemanticConnection {
@@ -118,22 +127,18 @@ pub enum SemanticConnection {
     Pin { reference: String, pin: String },
     /// Net label (e.g., "&VCC")
     Net(String),
-    /// Pullup resistor pattern: $PULLUP(R2, &VCC, 10k)
-    Pullup {
-        resistor_ref: String,
-        power_net: String,
+    /// Merged resistor - specialized in Display based on target
+    MergedResistor {
+        reference: String,
         value: String,
+        target: MergedTarget,
     },
-    /// Pulldown resistor pattern: $PULLDOWN(R3, 10k) - ground is implied
-    Pulldown {
-        resistor_ref: String,
-        value: String,
-    },
-    /// Decoupling capacitor pattern: $DECAP(C1, 100nF) or $DECAP(C1, 100nF, P) for polarized
-    DecouplingCap {
-        cap_ref: String,
+    /// Merged capacitor - specialized in Display based on target
+    MergedCapacitor {
+        reference: String,
         value: String,
         polarized: bool,
+        target: MergedTarget,
     },
 }
 
@@ -142,17 +147,37 @@ impl fmt::Display for SemanticConnection {
         match self {
             SemanticConnection::Pin { reference, pin } => write!(f, "{}:{}", reference, pin),
             SemanticConnection::Net(name) => write!(f, "&{}", name),
-            SemanticConnection::Pullup { resistor_ref, power_net, value } => {
-                write!(f, "$PULLUP({}, &{}, {})", resistor_ref, power_net, value)
+            SemanticConnection::MergedResistor { reference, value, target } => {
+                match target {
+                    MergedTarget::Net(net) => {
+                        let net_type = NetType::classify(net);
+                        if net_type.is_power() {
+                            write!(f, "$PULLUP({}, {}, &{})", reference, value, net)
+                        } else if net_type.is_ground() {
+                            write!(f, "$PULLDOWN({}, {})", reference, value)
+                        } else {
+                            write!(f, "$RESISTOR({}, {}, &{})", reference, value, net)
+                        }
+                    }
+                    MergedTarget::Pin { reference: pin_ref, pin } => {
+                        write!(f, "$RESISTOR({}, {}, {}:{})", reference, value, pin_ref, pin)
+                    }
+                }
             }
-            SemanticConnection::Pulldown { resistor_ref, value } => {
-                write!(f, "$PULLDOWN({}, {})", resistor_ref, value)
-            }
-            SemanticConnection::DecouplingCap { cap_ref, value, polarized } => {
-                if *polarized {
-                    write!(f, "$DECAP({}, {}, P)", cap_ref, value)
-                } else {
-                    write!(f, "$DECAP({}, {})", cap_ref, value)
+            SemanticConnection::MergedCapacitor { reference, value, polarized, target } => {
+                let suffix = if *polarized { ", P" } else { "" };
+                match target {
+                    MergedTarget::Net(net) => {
+                        let net_type = NetType::classify(net);
+                        if net_type.is_ground() {
+                            write!(f, "$DECAP({}, {}{})", reference, value, suffix)
+                        } else {
+                            write!(f, "$CAPACITOR({}, {}, &{}{})", reference, value, net, suffix)
+                        }
+                    }
+                    MergedTarget::Pin { reference: pin_ref, pin } => {
+                        write!(f, "$CAPACITOR({}, {}, {}:{}{})", reference, value, pin_ref, pin, suffix)
+                    }
                 }
             }
         }
@@ -221,8 +246,11 @@ impl SemanticOutline {
         for lib_id in lib_ids {
             let comps = &grouped[lib_id];
 
-            // Collect and sort instance references
-            let mut instances: Vec<&str> = comps.iter().map(|c| c.reference.as_str()).collect();
+            // Collect and sort instances with their values
+            let mut instances: Vec<(&str, &str)> = comps
+                .iter()
+                .map(|c| (c.reference.as_str(), c.value.as_str()))
+                .collect();
             instances.sort_by(|a, b| {
                 let parse_ref = |r: &str| -> (String, i32) {
                     let prefix: String = r.chars().take_while(|c| c.is_alphabetic()).collect();
@@ -234,19 +262,32 @@ impl SemanticOutline {
                         .unwrap_or(0);
                     (prefix, num)
                 };
-                parse_ref(a).cmp(&parse_ref(b))
+                parse_ref(a.0).cmp(&parse_ref(b.0))
             });
 
-            // Use first component for shared properties
+            // Get the symbol name from lib_id (part after the colon)
+            let symbol_name = lib_id.split(':').nth(1).unwrap_or("");
+
+            // Format instances as "REF=VALUE" or just "REF" if value is redundant
+            let instance_strs: Vec<String> = instances
+                .iter()
+                .map(|(ref_, val)| {
+                    // Omit value if empty, equals reference, or equals the symbol name
+                    if val.is_empty() || *val == *ref_ || *val == symbol_name {
+                        ref_.to_string()
+                    } else {
+                        format!("{}={}", ref_, val)
+                    }
+                })
+                .collect();
+
+            // Use first component for shared properties (pins, description)
             let first = comps[0];
 
             lines.push(format!("  {}", lib_id));
-            lines.push(format!("    Instances: {}", instances.join(" ")));
+            lines.push(format!("    Instances: {}", instance_strs.join(" ")));
             if !first.pins.is_empty() {
                 lines.push(format!("    Pins: {}", first.pins.join(" ")));
-            }
-            if !first.value.is_empty() && first.value != first.reference {
-                lines.push(format!("    Value: {}", first.value));
             }
             if let Some(desc) = &first.description {
                 lines.push(format!("    Label: {}", desc));
@@ -399,14 +440,13 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
             }
         }
 
-        // Determine net type
+        // Determine net type for this net
         let net_type = net.name.as_ref().map(|n| NetType::classify(n));
 
-        // Check for decoupling caps (capacitor between power and ground)
-        // A decoupling cap is part of BOTH a power net and a ground net
-        // We need to detect it by looking at what the capacitor connects to
-
-        // Process passive components for semantic patterns
+        // Process 2-pin passives for merging
+        // Rules for merging:
+        // 1. If the OTHER net is power/ground, merge into THIS net (power/ground acts as sink)
+        // 2. Otherwise, merge into the "larger" net (the one with more than just passive + 1 other pin)
         for (ref_, _pin) in &passive_pins {
             if absorbed.contains(*ref_) {
                 continue;
@@ -417,87 +457,94 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
                 None => continue,
             };
 
-            // Get the other pin of this 2-pin passive
-            let other_pin_net = find_other_pin_net(&net_data, ref_, net.name.as_deref());
+            // Get info about the other net this passive connects to
+            let other_info = find_other_pin_net_info(&net_data, ref_, net.name.as_deref());
 
-            match comp.component_type {
-                ComponentType::Resistor => {
-                    // Check for pullup: one pin to power, other to signal
-                    if let Some(other_net) = &other_pin_net {
-                        let other_type = NetType::classify(other_net);
+            if let Some(info) = other_info {
+                let other_type = NetType::classify(&info.net_name);
 
-                        if net_type == Some(NetType::Power) && other_type == NetType::Signal {
-                            // This net is power, other is signal - absorb as pullup on the signal net
-                            // Will be added when processing the signal net
-                        } else if net_type == Some(NetType::Signal) && other_type == NetType::Power {
-                            // This net is signal, other is power - add pullup here
-                            endpoints.push(SemanticConnection::Pullup {
-                                resistor_ref: ref_.to_string(),
-                                power_net: other_net.clone(),
+                let this_is_power_ground = net_type.map(|t| t.is_power() || t.is_ground()).unwrap_or(false);
+                let other_is_power_ground = other_type.is_power() || other_type.is_ground();
+                let this_is_ground = net_type.map(|t| t.is_ground()).unwrap_or(false);
+                let other_is_ground = other_type.is_ground();
+
+                // Check if we should merge this passive into THIS net
+                // Priority: always merge AWAY from power/ground nets, prefer non-GND over non-power
+                let should_merge_here = if this_is_power_ground && !other_is_power_ground {
+                    // THIS net is power/ground, other is not - don't merge here
+                    false
+                } else if other_is_power_ground && !this_is_power_ground {
+                    // Other net is power/ground - merge into THIS net
+                    true
+                } else if this_is_ground && other_is_power_ground && !other_is_ground {
+                    // Both are power/ground, but THIS is GND and other is power - merge to other
+                    false
+                } else if other_is_ground && this_is_power_ground && !this_is_ground {
+                    // Both are power/ground, but other is GND and THIS is power - merge here
+                    true
+                } else if let Some(ref _target_str) = info.single_other_pin {
+                    // Use "small net" logic - other net has only passive + 1 other pin
+                    true
+                } else {
+                    false
+                };
+
+                if should_merge_here {
+                    // Determine the target - either a net name or the single other pin
+                    let target = if other_type.is_power() || other_type.is_ground() {
+                        MergedTarget::Net(info.net_name.clone())
+                    } else if let Some(ref target_str) = info.single_other_pin {
+                        parse_merged_target(target_str, &info.net_name)
+                    } else {
+                        continue;
+                    };
+
+                    match comp.component_type {
+                        ComponentType::Resistor => {
+                            endpoints.push(SemanticConnection::MergedResistor {
+                                reference: ref_.to_string(),
                                 value: comp.value.clone(),
-                            });
-                            absorbed_in_this_net.push(ref_.to_string());
-                        } else if net_type == Some(NetType::Ground) && other_type == NetType::Signal {
-                            // This net is ground, other is signal - absorb as pulldown on signal net
-                            // Will be added when processing the signal net
-                        } else if net_type == Some(NetType::Signal) && other_type == NetType::Ground {
-                            // This net is signal, other is ground - add pulldown here
-                            endpoints.push(SemanticConnection::Pulldown {
-                                resistor_ref: ref_.to_string(),
-                                value: comp.value.clone(),
+                                target,
                             });
                             absorbed_in_this_net.push(ref_.to_string());
                         }
-                        // For resistors between two signals, don't absorb
-                    }
-                }
-                ComponentType::Capacitor { polarized } => {
-                    // Check for decoupling cap: any cap with one pin to ground
-                    if let Some(other_net) = &other_pin_net {
-                        let other_type = NetType::classify(other_net);
-
-                        if other_type == NetType::Ground && net_type != Some(NetType::Ground) {
-                            // Other pin is ground, current net is NOT ground
-                            // This cap decouples the current net - add annotation and absorb
-                            endpoints.push(SemanticConnection::DecouplingCap {
-                                cap_ref: ref_.to_string(),
+                        ComponentType::Capacitor { polarized } => {
+                            endpoints.push(SemanticConnection::MergedCapacitor {
+                                reference: ref_.to_string(),
                                 value: comp.value.clone(),
                                 polarized,
+                                target,
                             });
                             absorbed_in_this_net.push(ref_.to_string());
                         }
-                        // Don't absorb on the ground side - let the non-ground side handle it
-                        // This ensures the annotation gets added before the component is marked absorbed
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
 
         // Add non-absorbed passive pins as regular pin connections
         for (ref_, pin) in &passive_pins {
             if !absorbed.contains(*ref_) && !absorbed_in_this_net.contains(*ref_) {
-                // Check if this passive should be skipped because it will be absorbed elsewhere
-                let comp = components.get(*ref_);
-                let should_skip = if let Some(c) = comp {
-                    if let Some(other_net) = find_other_pin_net(&net_data, ref_, net.name.as_deref()) {
-                        let other_type = NetType::classify(&other_net);
+                // Check if this passive will be absorbed on the OTHER net
+                let should_skip = if let Some(info) = find_other_pin_net_info(&net_data, ref_, net.name.as_deref()) {
+                    let other_type = NetType::classify(&info.net_name);
+                    let this_is_power_ground = net_type.map(|t| t.is_power() || t.is_ground()).unwrap_or(false);
+                    let other_is_power_ground = other_type.is_power() || other_type.is_ground();
+                    let this_is_ground = net_type.map(|t| t.is_ground()).unwrap_or(false);
+                    let other_is_ground = other_type.is_ground();
 
-                        match c.component_type {
-                            // Cap on ground net with other pin on non-ground → will be $DECAP
-                            ComponentType::Capacitor { .. } if net_type == Some(NetType::Ground) => {
-                                other_type != NetType::Ground
-                            }
-                            // Resistor on ground net with other pin on signal → will be $PULLDOWN
-                            ComponentType::Resistor if net_type == Some(NetType::Ground) => {
-                                other_type == NetType::Signal
-                            }
-                            // Resistor on power net with other pin on signal → will be $PULLUP
-                            ComponentType::Resistor if net_type == Some(NetType::Power) => {
-                                other_type == NetType::Signal
-                            }
-                            _ => false
-                        }
+                    // Skip if this net is power/ground and other is not (will be merged there)
+                    if this_is_power_ground && !other_is_power_ground {
+                        true
+                    }
+                    // Skip if this is GND and other is power (will be merged there)
+                    else if this_is_ground && other_is_power_ground && !other_is_ground {
+                        true
+                    }
+                    // Skip if this net is "small" (passive + only 1 other pin)
+                    else if net.pins.len() == 2 {
+                        true
                     } else {
                         false
                     }
@@ -535,8 +582,9 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
             absorbed.insert(ref_);
         }
 
-        // Only add net if it has meaningful content
-        if endpoints.len() >= 2 || endpoints.iter().any(|e| !matches!(e, SemanticConnection::Net(_))) {
+        // Only add net if it has at least 2 meaningful endpoints
+        // (a single pin alone is not useful - it was likely absorbed into another net)
+        if endpoints.len() >= 2 {
             semantic_nets.push(ProcessedNet { endpoints });
         }
     }
@@ -598,8 +646,37 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
     }
 }
 
-/// Find the net that the other pin of a 2-pin component is connected to
-fn find_other_pin_net(nets: &[NetData], reference: &str, current_net: Option<&str>) -> Option<String> {
+/// Information about a component's connection on another net
+struct OtherNetInfo {
+    /// Name of the other net
+    net_name: String,
+    /// If there's exactly one other pin (not this component), its "ref:pin" string
+    single_other_pin: Option<String>,
+}
+
+/// Parse a merged target from a "ref:pin" string and net name
+/// If the target is a power symbol (starts with #), use the net name instead
+fn parse_merged_target(pin_str: &str, net_name: &str) -> MergedTarget {
+    let parts: Vec<&str> = pin_str.split(':').collect();
+    if parts.len() == 2 {
+        let reference = parts[0];
+        // Power symbols start with # - use the net name instead
+        if reference.starts_with('#') {
+            MergedTarget::Net(net_name.to_string())
+        } else {
+            MergedTarget::Pin {
+                reference: reference.to_string(),
+                pin: parts[1].to_string(),
+            }
+        }
+    } else {
+        // Fallback to net name
+        MergedTarget::Net(net_name.to_string())
+    }
+}
+
+/// Find detailed info about the net that the other pin of a 2-pin component is connected to
+fn find_other_pin_net_info(nets: &[NetData], reference: &str, current_net: Option<&str>) -> Option<OtherNetInfo> {
     for net in nets {
         // Skip the current net
         if net.name.as_deref() == current_net {
@@ -607,10 +684,22 @@ fn find_other_pin_net(nets: &[NetData], reference: &str, current_net: Option<&st
         }
 
         // Check if this component has a pin in this net
-        for (ref_, _pin) in &net.pins {
-            if ref_ == reference {
-                return net.name.clone();
-            }
+        let has_component = net.pins.iter().any(|(ref_, _)| ref_ == reference);
+        if has_component {
+            let other_pins: Vec<_> = net.pins.iter()
+                .filter(|(ref_, _)| ref_ != reference)
+                .collect();
+
+            let single_other_pin = if other_pins.len() == 1 {
+                Some(format!("{}:{}", other_pins[0].0, other_pins[0].1))
+            } else {
+                None
+            };
+
+            return Some(OtherNetInfo {
+                net_name: net.name.clone().unwrap_or_default(),
+                single_other_pin,
+            });
         }
     }
     None
@@ -673,31 +762,55 @@ mod tests {
         let net = SemanticConnection::Net("VCC".to_string());
         assert_eq!(net.to_string(), "&VCC");
 
-        let pullup = SemanticConnection::Pullup {
-            resistor_ref: "R1".to_string(),
-            power_net: "VCC".to_string(),
+        // Pullup: resistor to power net
+        let pullup = SemanticConnection::MergedResistor {
+            reference: "R1".to_string(),
             value: "10k".to_string(),
+            target: MergedTarget::Net("VCC".to_string()),
         };
-        assert_eq!(pullup.to_string(), "$PULLUP(R1, &VCC, 10k)");
+        assert_eq!(pullup.to_string(), "$PULLUP(R1, 10k, &VCC)");
 
-        let pulldown = SemanticConnection::Pulldown {
-            resistor_ref: "R2".to_string(),
+        // Pulldown: resistor to ground
+        let pulldown = SemanticConnection::MergedResistor {
+            reference: "R2".to_string(),
             value: "10k".to_string(),
+            target: MergedTarget::Net("GND".to_string()),
         };
         assert_eq!(pulldown.to_string(), "$PULLDOWN(R2, 10k)");
 
-        let decap = SemanticConnection::DecouplingCap {
-            cap_ref: "C1".to_string(),
+        // Series resistor to a pin
+        let series = SemanticConnection::MergedResistor {
+            reference: "R3".to_string(),
+            value: "100".to_string(),
+            target: MergedTarget::Pin { reference: "U1".to_string(), pin: "TX".to_string() },
+        };
+        assert_eq!(series.to_string(), "$RESISTOR(R3, 100, U1:TX)");
+
+        // Decoupling cap to ground
+        let decap = SemanticConnection::MergedCapacitor {
+            reference: "C1".to_string(),
             value: "100nF".to_string(),
             polarized: false,
+            target: MergedTarget::Net("GND".to_string()),
         };
         assert_eq!(decap.to_string(), "$DECAP(C1, 100nF)");
 
-        let decap_polar = SemanticConnection::DecouplingCap {
-            cap_ref: "C2".to_string(),
+        // Polarized decoupling cap
+        let decap_polar = SemanticConnection::MergedCapacitor {
+            reference: "C2".to_string(),
             value: "10uF".to_string(),
             polarized: true,
+            target: MergedTarget::Net("GND".to_string()),
         };
         assert_eq!(decap_polar.to_string(), "$DECAP(C2, 10uF, P)");
+
+        // Capacitor to power net (not ground)
+        let cap_power = SemanticConnection::MergedCapacitor {
+            reference: "C3".to_string(),
+            value: "1uF".to_string(),
+            polarized: false,
+            target: MergedTarget::Net("VCC".to_string()),
+        };
+        assert_eq!(cap_power.to_string(), "$CAPACITOR(C3, 1uF, &VCC)");
     }
 }
