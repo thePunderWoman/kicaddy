@@ -177,10 +177,8 @@ pub struct CompileYamlRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OutlineRequest {
-    /// Path to schematic file (.kicad_sch or .yaml)
+    /// Path to .kicad_sch file
     pub path: String,
-    /// Output format: "text" (default) for semantic outline, "json" for structured data
-    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -291,50 +289,14 @@ fn empty_tool(name: &str, description: &str) -> McpTool {
 // Tool Implementations
 // ============================================================================
 
-fn execute_outline(file_path: &str, format: Option<&str>) -> Result<String, String> {
+fn execute_outline(file_path: &str) -> Result<String, String> {
     let path = PathBuf::from(file_path);
-    let format = format.unwrap_or("text");
 
-    // Detect file type and load schematic
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let schematic = parse_schematic(&path)
+        .map_err(|e| format!("Failed to parse schematic: {}", e))?;
 
-    let schematic = match extension {
-        "yaml" | "yml" => {
-            // Load and compile YAML schematic
-            let yaml_sch = YamlSchematic::from_file(&path)
-                .map_err(|e| format!("Failed to parse YAML: {}", e))?;
-
-            let compiler = Compiler::new()
-                .map_err(|e| format!("KiCAD config error: {}", e))?;
-
-            let compile_output = compiler.compile(&yaml_sch)
-                .map_err(|e| format!("Failed to compile YAML: {}", e))?;
-
-            compile_output.schematic
-        }
-        "kicad_sch" => {
-            // Parse KiCAD schematic directly
-            parse_schematic(&path)
-                .map_err(|e| format!("Failed to parse schematic: {}", e))?
-        }
-        _ => {
-            return Err(format!("Unsupported file type: {}. Use .kicad_sch or .yaml", extension));
-        }
-    };
-
-    match format {
-        "text" => {
-            // Use new semantic outline
-            let outline = build_semantic_outline(&schematic);
-            Ok(outline.to_text())
-        }
-        "json" => {
-            // Use old JSON format for backward compatibility
-            let outline = libkicaddy::tools::outline::build_outline(&schematic);
-            serde_json::to_string_pretty(&outline).map_err(|e| e.to_string())
-        }
-        _ => Err(format!("Unknown format: {}. Use 'text' or 'json'", format)),
-    }
+    let outline = build_semantic_outline(&schematic);
+    Ok(outline.to_text())
 }
 
 fn execute_netlist(yaml_path: &str, filter: Option<&str>) -> Result<String, String> {
@@ -590,7 +552,7 @@ impl ServerHandler for KicaddyService {
                     ),
                     make_tool::<OutlineRequest>(
                         "outline",
-                        "Get a semantic outline of a schematic (.kicad_sch or .yaml). Shows components with pins and connections with automatic detection of pullup/pulldown resistors and decoupling caps. Use format='json' for structured data.",
+                        "Get a semantic outline of a .kicad_sch schematic. Shows components with pins and connections with automatic detection of pullup/pulldown resistors and decoupling caps.",
                     ),
                     make_tool::<NetlistRequest>(
                         "netlist",
@@ -641,7 +603,7 @@ impl ServerHandler for KicaddyService {
                 "outline" => {
                     let req: OutlineRequest = serde_json::from_value(args_value)
                         .map_err(|e| rmcp::ErrorData::invalid_params(format!("Invalid params: {}", e), None))?;
-                    execute_outline(&req.path, req.format.as_deref())
+                    execute_outline(&req.path)
                         .unwrap_or_else(|e| format!("Error: {}", e))
                 }
                 "netlist" => {

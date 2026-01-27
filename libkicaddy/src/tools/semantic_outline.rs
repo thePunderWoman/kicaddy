@@ -88,12 +88,13 @@ impl NetType {
     pub fn classify(name: &str) -> Self {
         let upper = name.to_uppercase();
 
-        // Ground nets
-        if matches!(upper.as_str(), "GND" | "AGND" | "DGND" | "PGND" | "VSS" | "GNDA" | "GNDD") {
+        // Ground nets - explicitly GND variants only
+        // Note: VSS is a power rail (negative supply), not ground
+        if matches!(upper.as_str(), "GND" | "AGND" | "DGND" | "PGND" | "GNDA" | "GNDD") {
             return NetType::Ground;
         }
 
-        // Power nets
+        // Power nets (includes VCC, VDD, VSS, +3V3, etc.)
         if is_power_net_name(name) {
             return NetType::Power;
         }
@@ -420,23 +421,22 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
                     }
                 }
                 ComponentType::Capacitor { polarized } => {
-                    // Check for decoupling cap: one pin to power, other to ground
+                    // Check for decoupling cap: any cap with one pin to ground
                     if let Some(other_net) = &other_pin_net {
                         let other_type = NetType::classify(other_net);
 
-                        if net_type == Some(NetType::Power) && other_type == NetType::Ground {
-                            // This is a decoupling cap - add annotation on power net
+                        if other_type == NetType::Ground && net_type != Some(NetType::Ground) {
+                            // Other pin is ground, current net is NOT ground
+                            // This cap decouples the current net - add annotation and absorb
                             endpoints.push(SemanticConnection::DecouplingCap {
                                 cap_ref: ref_.to_string(),
                                 value: comp.value.clone(),
                                 polarized,
                             });
                             absorbed_in_this_net.push(ref_.to_string());
-                        } else if net_type == Some(NetType::Ground) && other_type == NetType::Power {
-                            // Same cap, but we're on the ground side - don't add again
-                            // Just mark as absorbed if not already
-                            absorbed_in_this_net.push(ref_.to_string());
                         }
+                        // Don't absorb on the ground side - let the non-ground side handle it
+                        // This ensures the annotation gets added before the component is marked absorbed
                     }
                 }
                 _ => {}
@@ -446,10 +446,40 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
         // Add non-absorbed passive pins as regular pin connections
         for (ref_, pin) in &passive_pins {
             if !absorbed.contains(*ref_) && !absorbed_in_this_net.contains(*ref_) {
-                endpoints.push(SemanticConnection::Pin {
-                    reference: ref_.to_string(),
-                    pin: pin.to_string(),
-                });
+                // Check if this passive should be skipped because it will be absorbed elsewhere
+                let comp = components.get(*ref_);
+                let should_skip = if let Some(c) = comp {
+                    if let Some(other_net) = find_other_pin_net(&net_data, ref_, net.name.as_deref()) {
+                        let other_type = NetType::classify(&other_net);
+
+                        match c.component_type {
+                            // Cap on ground net with other pin on non-ground → will be $DECAP
+                            ComponentType::Capacitor { .. } if net_type == Some(NetType::Ground) => {
+                                other_type != NetType::Ground
+                            }
+                            // Resistor on ground net with other pin on signal → will be $PULLDOWN
+                            ComponentType::Resistor if net_type == Some(NetType::Ground) => {
+                                other_type == NetType::Signal
+                            }
+                            // Resistor on power net with other pin on signal → will be $PULLUP
+                            ComponentType::Resistor if net_type == Some(NetType::Power) => {
+                                other_type == NetType::Signal
+                            }
+                            _ => false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !should_skip {
+                    endpoints.push(SemanticConnection::Pin {
+                        reference: ref_.to_string(),
+                        pin: pin.to_string(),
+                    });
+                }
             }
         }
 
@@ -587,9 +617,17 @@ mod tests {
 
     #[test]
     fn test_net_type_classify() {
+        // Ground variants
         assert_eq!(NetType::classify("GND"), NetType::Ground);
+        assert_eq!(NetType::classify("AGND"), NetType::Ground);
+        assert_eq!(NetType::classify("DGND"), NetType::Ground);
+        // VSS is a power rail (negative supply), not ground
+        assert_eq!(NetType::classify("VSS"), NetType::Power);
+        // Other power nets
         assert_eq!(NetType::classify("VCC"), NetType::Power);
+        assert_eq!(NetType::classify("VDD"), NetType::Power);
         assert_eq!(NetType::classify("+3V3"), NetType::Power);
+        // Signal nets
         assert_eq!(NetType::classify("SDA"), NetType::Signal);
     }
 

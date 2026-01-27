@@ -152,7 +152,7 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
     // Step 1: Collect all connection points
     let mut connection_points: Vec<ConnectionPoint> = Vec::new();
 
-    // Add pin positions
+    // Add pin positions and power symbols
     for symbol in &schematic.symbols {
         let reference = symbol
             .properties
@@ -160,6 +160,31 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
             .find(|p| p.name == "Reference")
             .map(|p| p.value.clone())
             .unwrap_or_else(|| "?".to_string());
+
+        // Power symbols (reference starts with #) create implicit global nets
+        // Their Value property becomes the net name (e.g., GND, +5V)
+        if reference.starts_with('#') {
+            let net_name = symbol
+                .properties
+                .iter()
+                .find(|p| p.name == "Value")
+                .map(|p| p.value.clone())
+                .unwrap_or_default();
+
+            // Add the power symbol's pin as a global label
+            for pin in &symbol.pins {
+                if let Some((pos, _angle)) = schematic.get_pin_position(symbol, &pin.number) {
+                    connection_points.push(ConnectionPoint {
+                        position: pos,
+                        kind: ConnectionKind::Label {
+                            name: net_name.clone(),
+                            is_global: true,
+                        },
+                    });
+                }
+            }
+            continue;
+        }
 
         // Get lib_symbol for pin names
         let lib_symbol = schematic.lib_symbols.iter().find(|s| s.name == symbol.lib_id);
@@ -364,6 +389,11 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
             .find(|p| p.name == "Reference")
             .map(|p| p.value.clone())
             .unwrap_or_else(|| "?".to_string());
+
+        // Skip power symbols (they're handled as implicit global labels)
+        if reference.starts_with('#') {
+            continue;
+        }
 
         let value = symbol
             .properties

@@ -12,7 +12,7 @@ use libkicaddy::common::{Point, Position};
 use libkicaddy::parser::sexpr::ToSExpr;
 use libkicaddy::schematic::Schematic;
 use libkicaddy::tools::{
-    OutlineInput, OutlineTool, Tool, UpdateComponentInput, UpdateComponentTool,
+    Tool, UpdateComponentInput, UpdateComponentTool, build_semantic_outline,
 };
 use libkicaddy::{
     build_index, find_symbol, parse_schematic, parse_symbol_library, search, KicadConfig,
@@ -188,13 +188,10 @@ enum Commands {
         #[arg(long)]
         y: Option<f64>,
     },
-    /// Get outline view of schematic (components, pins, nets)
+    /// Get semantic outline of schematic (components, connections with pullup/pulldown/decap detection)
     Outline {
-        /// Path to the .kicad_sch file
+        /// Path to .kicad_sch file
         schematic: PathBuf,
-        /// Output as JSON (for MCP integration)
-        #[arg(short, long)]
-        json: bool,
     },
     /// Update a component's properties (position, angle, reference, value, mirror)
     UpdateComponent {
@@ -923,64 +920,14 @@ fn main() {
                 }
             }
         }
-        Commands::Outline { schematic, json } => {
-            let input = OutlineInput { schematic };
-            match OutlineTool::execute(input) {
-                Ok(output) => {
-                    if json {
-                        match serde_json::to_string_pretty(&output) {
-                            Ok(json_str) => println!("{}", json_str),
-                            Err(e) => {
-                                eprintln!("Error serializing output: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else {
-                        // Human-readable output
-                        println!("Schematic Outline");
-                        println!("=================\n");
-
-                        println!(
-                            "Stats: {} components, {} wires, {} nets\n",
-                            output.stats.component_count,
-                            output.stats.wire_count,
-                            output.stats.net_count
-                        );
-
-                        println!("Components:");
-                        for comp in &output.components {
-                            println!(
-                                "  {} ({}) = {}",
-                                comp.reference, comp.lib_id, comp.value
-                            );
-                            println!(
-                                "    Position: ({:.2}, {:.2}), Angle: {}°",
-                                comp.x, comp.y, comp.angle
-                            );
-                            for pin in &comp.pins {
-                                let net_str = pin.net.as_deref().unwrap_or("-");
-                                if pin.name != pin.number && pin.name != "~" {
-                                    println!(
-                                        "    Pin {} ({}): {}",
-                                        pin.number, pin.name, net_str
-                                    );
-                                } else {
-                                    println!("    Pin {}: {}", pin.number, net_str);
-                                }
-                            }
-                        }
-
-                        if !output.nets.is_empty() {
-                            println!("\nNets:");
-                            for net in &output.nets {
-                                let global_marker = if net.is_global { " (global)" } else { "" };
-                                println!("  {}{}: {}", net.name, global_marker, net.connections.join(", "));
-                            }
-                        }
-                    }
+        Commands::Outline { schematic } => {
+            match parse_schematic(&schematic) {
+                Ok(sch) => {
+                    let outline = build_semantic_outline(&sch);
+                    println!("{}", outline.to_text());
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error parsing schematic: {}", e);
                     std::process::exit(1);
                 }
             }
