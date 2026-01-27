@@ -207,22 +207,53 @@ impl SemanticOutline {
         let mut lines = Vec::new();
 
         lines.push("Components:".to_string());
-        lines.push(String::new());
 
+        // Group components by lib_id
+        let mut grouped: HashMap<String, Vec<&SemanticComponent>> = HashMap::new();
         for comp in &self.components {
-            lines.push(format!("{} - {}", comp.reference, comp.lib_id));
-            if !comp.pins.is_empty() {
-                lines.push(format!("  Pins: {}", comp.pins.join(", ")));
-            }
-            if !comp.value.is_empty() && comp.value != comp.reference {
-                lines.push(format!("  Value: {}", comp.value));
-            }
-            if let Some(desc) = &comp.description {
-                lines.push(format!("  Label: {}", desc));
-            }
-            lines.push(String::new());
+            grouped.entry(comp.lib_id.clone()).or_default().push(comp);
         }
 
+        // Sort groups by lib_id
+        let mut lib_ids: Vec<&String> = grouped.keys().collect();
+        lib_ids.sort();
+
+        for lib_id in lib_ids {
+            let comps = &grouped[lib_id];
+
+            // Collect and sort instance references
+            let mut instances: Vec<&str> = comps.iter().map(|c| c.reference.as_str()).collect();
+            instances.sort_by(|a, b| {
+                let parse_ref = |r: &str| -> (String, i32) {
+                    let prefix: String = r.chars().take_while(|c| c.is_alphabetic()).collect();
+                    let num: i32 = r
+                        .chars()
+                        .skip_while(|c| c.is_alphabetic())
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(0);
+                    (prefix, num)
+                };
+                parse_ref(a).cmp(&parse_ref(b))
+            });
+
+            // Use first component for shared properties
+            let first = comps[0];
+
+            lines.push(format!("  {}", lib_id));
+            lines.push(format!("    Instances: {}", instances.join(" ")));
+            if !first.pins.is_empty() {
+                lines.push(format!("    Pins: {}", first.pins.join(" ")));
+            }
+            if !first.value.is_empty() && first.value != first.reference {
+                lines.push(format!("    Value: {}", first.value));
+            }
+            if let Some(desc) = &first.description {
+                lines.push(format!("    Label: {}", desc));
+            }
+        }
+
+        lines.push(String::new());
         lines.push("Connections:".to_string());
         lines.push(String::new());
 
