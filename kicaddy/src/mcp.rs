@@ -21,9 +21,10 @@ use serde_json::Map;
 
 use libkicaddy::tools::{
     wrappers::{SearchSymbolInput, SearchSymbolTool},
-    Tool,
+    Tool, build_semantic_outline,
 };
 use libkicaddy::yaml::{YamlSchematic, Compiler};
+use libkicaddy::parse_schematic;
 
 /// Example YAML schematic demonstrating all features
 const EXAMPLE_YAML: &str = r#"# KiCAD Schematic Definition
@@ -176,8 +177,10 @@ pub struct CompileYamlRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OutlineRequest {
-    /// Path to the YAML schematic definition file
-    pub yaml_path: String,
+    /// Path to schematic file (.kicad_sch or .yaml)
+    pub path: String,
+    /// Output format: "text" (default) for semantic outline, "json" for structured data
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -197,40 +200,8 @@ pub struct GetSymbolInfoRequest {
 }
 
 // ============================================================================
-// Output Types for YAML tools
+// Output Types for tools
 // ============================================================================
-
-#[derive(Debug, Serialize)]
-struct OutlineOutput {
-    meta: MetaInfo,
-    components: Vec<ComponentInfo>,
-    connections: Vec<ConnectionInfo>,
-    groups: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct MetaInfo {
-    paper: String,
-    title: Option<String>,
-    author: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ComponentInfo {
-    reference: String,
-    symbol: String,
-    position: Option<[f64; 2]>,
-    angle: f64,
-    value: Option<String>,
-    group: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ConnectionInfo {
-    net: Option<String>,
-    pins: Vec<String>,
-    global: bool,
-}
 
 #[derive(Debug, Serialize)]
 struct SymbolInfoOutput {
@@ -316,99 +287,54 @@ fn empty_tool(name: &str, description: &str) -> McpTool {
     }
 }
 
-/// Check if a net name is a power net
-fn is_power_net(name: &str) -> bool {
-    let upper = name.to_uppercase();
-
-    if matches!(upper.as_str(), "GND" | "AGND" | "DGND" | "PGND" | "VSS" | "GNDA" | "GNDD") {
-        return true;
-    }
-
-    if upper.starts_with("VCC") || upper.starts_with("VDD") || upper.starts_with("VSS") {
-        return true;
-    }
-
-    if (upper.starts_with('+') || upper.starts_with('-')) && upper.contains('V') {
-        return true;
-    }
-
-    if matches!(upper.as_str(), "3V3" | "5V" | "12V" | "1V8" | "2V5" | "VBAT" | "VIN" | "VOUT") {
-        return true;
-    }
-
-    false
-}
-
 // ============================================================================
 // Tool Implementations
 // ============================================================================
 
-fn execute_outline(yaml_path: &str) -> Result<String, String> {
-    let path = PathBuf::from(yaml_path);
-    let yaml_sch = YamlSchematic::from_file(&path)
-        .map_err(|e| format!("Failed to parse YAML: {}", e))?;
+fn execute_outline(file_path: &str, format: Option<&str>) -> Result<String, String> {
+    let path = PathBuf::from(file_path);
+    let format = format.unwrap_or("text");
 
-    let mut components = Vec::new();
-    let mut groups = Vec::new();
+    // Detect file type and load schematic
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    // Collect top-level components
-    for (reference, comp) in &yaml_sch.components {
-        components.push(ComponentInfo {
-            reference: reference.clone(),
-            symbol: comp.symbol.clone(),
-            position: comp.position.as_ref().map(|p| [p.x(), p.y()]),
-            angle: comp.angle,
-            value: comp.value.clone(),
-            group: None,
-        });
-    }
+    let schematic = match extension {
+        "yaml" | "yml" => {
+            // Load and compile YAML schematic
+            let yaml_sch = YamlSchematic::from_file(&path)
+                .map_err(|e| format!("Failed to parse YAML: {}", e))?;
 
-    // Collect group components
-    for (group_name, group) in &yaml_sch.groups {
-        groups.push(group_name.clone());
-        for (reference, comp) in &group.components {
-            components.push(ComponentInfo {
-                reference: reference.clone(),
-                symbol: comp.symbol.clone(),
-                position: comp.position.as_ref().map(|p| [p.x(), p.y()]),
-                angle: comp.angle,
-                value: comp.value.clone(),
-                group: Some(group_name.clone()),
-            });
+            let compiler = Compiler::new()
+                .map_err(|e| format!("KiCAD config error: {}", e))?;
+
+            let compile_output = compiler.compile(&yaml_sch)
+                .map_err(|e| format!("Failed to compile YAML: {}", e))?;
+
+            compile_output.schematic
         }
-    }
-
-    // Sort components by reference
-    components.sort_by(|a, b| a.reference.cmp(&b.reference));
-
-    // Collect all connections
-    let all_connections = yaml_sch.all_connections();
-    let connections: Vec<ConnectionInfo> = all_connections
-        .iter()
-        .map(|conn| {
-            let is_global = conn.global.unwrap_or_else(|| {
-                conn.net.as_ref().map(|n| is_power_net(n)).unwrap_or(false)
-            });
-            ConnectionInfo {
-                net: conn.net.clone(),
-                pins: conn.pins.clone(),
-                global: is_global,
-            }
-        })
-        .collect();
-
-    let output = OutlineOutput {
-        meta: MetaInfo {
-            paper: yaml_sch.meta.paper.clone(),
-            title: yaml_sch.meta.title.clone(),
-            author: yaml_sch.meta.author.clone(),
-        },
-        components,
-        connections,
-        groups,
+        "kicad_sch" => {
+            // Parse KiCAD schematic directly
+            parse_schematic(&path)
+                .map_err(|e| format!("Failed to parse schematic: {}", e))?
+        }
+        _ => {
+            return Err(format!("Unsupported file type: {}. Use .kicad_sch or .yaml", extension));
+        }
     };
 
-    serde_json::to_string_pretty(&output).map_err(|e| e.to_string())
+    match format {
+        "text" => {
+            // Use new semantic outline
+            let outline = build_semantic_outline(&schematic);
+            Ok(outline.to_text())
+        }
+        "json" => {
+            // Use old JSON format for backward compatibility
+            let outline = libkicaddy::tools::outline::build_outline(&schematic);
+            serde_json::to_string_pretty(&outline).map_err(|e| e.to_string())
+        }
+        _ => Err(format!("Unknown format: {}. Use 'text' or 'json'", format)),
+    }
 }
 
 fn execute_netlist(yaml_path: &str, filter: Option<&str>) -> Result<String, String> {
@@ -664,7 +590,7 @@ impl ServerHandler for KicaddyService {
                     ),
                     make_tool::<OutlineRequest>(
                         "outline",
-                        "Get an outline of a YAML schematic: components, their positions, and defined connections.",
+                        "Get a semantic outline of a schematic (.kicad_sch or .yaml). Shows components with pins and connections with automatic detection of pullup/pulldown resistors and decoupling caps. Use format='json' for structured data.",
                     ),
                     make_tool::<NetlistRequest>(
                         "netlist",
@@ -715,7 +641,7 @@ impl ServerHandler for KicaddyService {
                 "outline" => {
                     let req: OutlineRequest = serde_json::from_value(args_value)
                         .map_err(|e| rmcp::ErrorData::invalid_params(format!("Invalid params: {}", e), None))?;
-                    execute_outline(&req.yaml_path)
+                    execute_outline(&req.path, req.format.as_deref())
                         .unwrap_or_else(|e| format!("Error: {}", e))
                 }
                 "netlist" => {

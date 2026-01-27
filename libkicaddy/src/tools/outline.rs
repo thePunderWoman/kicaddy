@@ -148,7 +148,7 @@ impl Tool for OutlineTool {
 }
 
 /// Build the outline from a schematic
-fn build_outline(schematic: &Schematic) -> OutlineOutput {
+pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
     // Step 1: Collect all connection points
     let mut connection_points: Vec<ConnectionPoint> = Vec::new();
 

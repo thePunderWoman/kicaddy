@@ -4,10 +4,12 @@
 //! Tools provide JSON schema generation via schemars for MCP integration.
 
 pub mod outline;
+pub mod semantic_outline;
 pub mod update_component;
 pub mod wrappers;
 
 pub use outline::{OutlineTool, OutlineInput, OutlineOutput};
+pub use semantic_outline::{build_semantic_outline, SemanticOutline, SemanticComponent, SemanticConnection, ProcessedNet};
 pub use update_component::{UpdateComponentTool, UpdateComponentInput, UpdateComponentOutput};
 
 use schemars::JsonSchema;
