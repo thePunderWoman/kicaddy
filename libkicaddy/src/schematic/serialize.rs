@@ -119,6 +119,11 @@ impl ToSExpr for Schematic {
             items.push(sym.to_sexpr());
         }
 
+        // sheets
+        for sheet in &self.sheets {
+            items.push(sheet.to_sexpr());
+        }
+
         // sheet_instances
         if !self.sheet_instances.is_empty() {
             let mut sheet_items = vec![SExpr::symbol("sheet_instances")];
@@ -546,6 +551,178 @@ impl ToSExpr for SheetInstance {
             SExpr::string(&self.path),
             SExpr::list(vec![SExpr::symbol("page"), SExpr::string(&self.page)]),
         ])
+    }
+}
+
+impl ToSExpr for Sheet {
+    fn to_sexpr(&self) -> SExpr {
+        let mut items = vec![SExpr::symbol("sheet")];
+
+        // Position (at x y) - no angle for sheets
+        items.push(SExpr::list(vec![
+            SExpr::symbol("at"),
+            SExpr::number(self.position.x),
+            SExpr::number(self.position.y),
+        ]));
+
+        // Size
+        items.push(SExpr::list(vec![
+            SExpr::symbol("size"),
+            SExpr::number(self.size.0),
+            SExpr::number(self.size.1),
+        ]));
+
+        items.push(SExpr::list(vec![
+            SExpr::symbol("exclude_from_sim"),
+            SExpr::symbol(if self.exclude_from_sim { "yes" } else { "no" }),
+        ]));
+
+        items.push(SExpr::list(vec![
+            SExpr::symbol("in_bom"),
+            SExpr::symbol(if self.in_bom { "yes" } else { "no" }),
+        ]));
+
+        items.push(SExpr::list(vec![
+            SExpr::symbol("on_board"),
+            SExpr::symbol(if self.on_board { "yes" } else { "no" }),
+        ]));
+
+        items.push(SExpr::list(vec![
+            SExpr::symbol("dnp"),
+            SExpr::symbol(if self.dnp { "yes" } else { "no" }),
+        ]));
+
+        if self.fields_autoplaced {
+            items.push(SExpr::list(vec![
+                SExpr::symbol("fields_autoplaced"),
+                SExpr::symbol("yes"),
+            ]));
+        }
+
+        // Stroke (default)
+        items.push(SExpr::list(vec![
+            SExpr::symbol("stroke"),
+            SExpr::list(vec![SExpr::symbol("width"), SExpr::number(0.1524)]),
+            SExpr::list(vec![SExpr::symbol("type"), SExpr::symbol("solid")]),
+        ]));
+
+        // Fill
+        items.push(SExpr::list(vec![
+            SExpr::symbol("fill"),
+            SExpr::list(vec![
+                SExpr::symbol("color"),
+                SExpr::number(0.0),
+                SExpr::number(0.0),
+                SExpr::number(0.0),
+                SExpr::number(0.0),
+            ]),
+        ]));
+
+        // UUID
+        items.push(SExpr::list(vec![
+            SExpr::symbol("uuid"),
+            SExpr::string(&self.uuid),
+        ]));
+
+        // Sheetname property
+        items.push(SExpr::list(vec![
+            SExpr::symbol("property"),
+            SExpr::string("Sheetname"),
+            SExpr::string(&self.sheet_name),
+            SExpr::list(vec![
+                SExpr::symbol("at"),
+                SExpr::number(self.position.x),
+                SExpr::number(self.position.y - 0.7116),
+                SExpr::number(0.0),
+            ]),
+            SExpr::list(vec![
+                SExpr::symbol("effects"),
+                SExpr::list(vec![
+                    SExpr::symbol("font"),
+                    SExpr::list(vec![
+                        SExpr::symbol("size"),
+                        SExpr::number(1.27),
+                        SExpr::number(1.27),
+                    ]),
+                ]),
+                SExpr::list(vec![
+                    SExpr::symbol("justify"),
+                    SExpr::symbol("left"),
+                    SExpr::symbol("bottom"),
+                ]),
+            ]),
+        ]));
+
+        // Sheetfile property
+        items.push(SExpr::list(vec![
+            SExpr::symbol("property"),
+            SExpr::string("Sheetfile"),
+            SExpr::string(&self.sheet_file),
+            SExpr::list(vec![
+                SExpr::symbol("at"),
+                SExpr::number(self.position.x),
+                SExpr::number(self.position.y + self.size.1 + 0.5846),
+                SExpr::number(0.0),
+            ]),
+            SExpr::list(vec![
+                SExpr::symbol("effects"),
+                SExpr::list(vec![
+                    SExpr::symbol("font"),
+                    SExpr::list(vec![
+                        SExpr::symbol("size"),
+                        SExpr::number(1.27),
+                        SExpr::number(1.27),
+                    ]),
+                ]),
+                SExpr::list(vec![
+                    SExpr::symbol("justify"),
+                    SExpr::symbol("left"),
+                    SExpr::symbol("top"),
+                ]),
+            ]),
+        ]));
+
+        // Pins
+        for pin in &self.pins {
+            items.push(pin.to_sexpr());
+        }
+
+        SExpr::list(items)
+    }
+}
+
+impl ToSExpr for SheetPin {
+    fn to_sexpr(&self) -> SExpr {
+        let mut items = vec![
+            SExpr::symbol("pin"),
+            SExpr::string(&self.name),
+            SExpr::symbol(self.shape.as_str()),
+        ];
+
+        items.push(self.position.to_sexpr());
+
+        items.push(SExpr::list(vec![
+            SExpr::symbol("uuid"),
+            SExpr::string(&self.uuid),
+        ]));
+
+        items.push(SExpr::list(vec![
+            SExpr::symbol("effects"),
+            SExpr::list(vec![
+                SExpr::symbol("font"),
+                SExpr::list(vec![
+                    SExpr::symbol("size"),
+                    SExpr::number(1.27),
+                    SExpr::number(1.27),
+                ]),
+            ]),
+            SExpr::list(vec![
+                SExpr::symbol("justify"),
+                SExpr::symbol("right"),
+            ]),
+        ]));
+
+        SExpr::list(items)
     }
 }
 

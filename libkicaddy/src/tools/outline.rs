@@ -109,13 +109,27 @@ pub struct PinInfo {
     pub y: f64,
 }
 
+/// Net label scope - determines the visibility/reach of a net
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NetLabelScope {
+    /// Global scope - visible across all sheets (from global_label or power symbols)
+    #[default]
+    Global,
+    /// Hierarchical scope - connects parent/child sheets (from hierarchical_label)
+    Hierarchical,
+    /// Local scope - only visible within current sheet (from label)
+    Local,
+}
+
 /// Information about a net
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetInfo {
     /// Net name
     pub name: String,
-    /// Whether this is a global net (from global label)
+    /// Whether this is a global net (from global label) - kept for backward compatibility
     pub is_global: bool,
+    /// Net label scope (Global, Hierarchical, or Local)
+    pub scope: NetLabelScope,
     /// Connections in "REF:PIN" format
     pub connections: Vec<String>,
 }
@@ -178,7 +192,7 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
                         position: pos,
                         kind: ConnectionKind::Label {
                             name: net_name.clone(),
-                            is_global: true,
+                            scope: NetLabelScope::Global,
                         },
                     });
                 }
@@ -245,13 +259,13 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
         });
     }
 
-    // Add labels
+    // Add local labels
     for label in &schematic.labels {
         connection_points.push(ConnectionPoint {
             position: Point::new(label.position.x, label.position.y),
             kind: ConnectionKind::Label {
                 name: label.text.clone(),
-                is_global: false,
+                scope: NetLabelScope::Local,
             },
         });
     }
@@ -262,9 +276,33 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
             position: Point::new(label.position.x, label.position.y),
             kind: ConnectionKind::Label {
                 name: label.text.clone(),
-                is_global: true,
+                scope: NetLabelScope::Global,
             },
         });
+    }
+
+    // Add hierarchical labels
+    for label in &schematic.hierarchical_labels {
+        connection_points.push(ConnectionPoint {
+            position: Point::new(label.position.x, label.position.y),
+            kind: ConnectionKind::Label {
+                name: label.text.clone(),
+                scope: NetLabelScope::Hierarchical,
+            },
+        });
+    }
+
+    // Add sheet pins
+    for sheet in &schematic.sheets {
+        for pin in &sheet.pins {
+            connection_points.push(ConnectionPoint {
+                position: Point::new(pin.position.x, pin.position.y),
+                kind: ConnectionKind::SheetPin {
+                    sheet_name: sheet.sheet_name.clone(),
+                    pin_name: pin.name.clone(),
+                },
+            });
+        }
     }
 
     // Step 2: Build connectivity using union-find
@@ -323,9 +361,10 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
     let mut auto_net_counter = 1;
 
     for (_root, indices) in &net_groups {
-        // Find pins and labels in this group
+        // Find pins, sheet pins, and labels in this group
         let mut pins: Vec<(String, String)> = Vec::new();
-        let mut label_name: Option<(String, bool)> = None;
+        let mut sheet_pins: Vec<(String, String)> = Vec::new(); // (sheet_name, pin_name)
+        let mut label_info: Option<(String, NetLabelScope)> = None;
 
         for &idx in indices {
             match &connection_points[idx].kind {
@@ -336,45 +375,60 @@ pub fn build_outline(schematic: &Schematic) -> OutlineOutput {
                 } => {
                     pins.push((reference.clone(), pin_number.clone()));
                 }
-                ConnectionKind::Label { name, is_global } => {
-                    // Prefer global labels over local labels
-                    match &label_name {
-                        None => label_name = Some((name.clone(), *is_global)),
-                        Some((_, false)) if *is_global => label_name = Some((name.clone(), true)),
-                        _ => {}
+                ConnectionKind::SheetPin {
+                    sheet_name,
+                    pin_name,
+                } => {
+                    sheet_pins.push((sheet_name.clone(), pin_name.clone()));
+                }
+                ConnectionKind::Label { name, scope } => {
+                    // Prefer labels with higher scope: Global > Hierarchical > Local
+                    let should_update = match (&label_info, scope) {
+                        (None, _) => true,
+                        (Some((_, NetLabelScope::Local)), NetLabelScope::Hierarchical | NetLabelScope::Global) => true,
+                        (Some((_, NetLabelScope::Hierarchical)), NetLabelScope::Global) => true,
+                        _ => false,
+                    };
+                    if should_update {
+                        label_info = Some((name.clone(), *scope));
                     }
                 }
                 _ => {}
             }
         }
 
-        // Only create net if there are pins connected
-        if pins.is_empty() {
+        // Only create net if there are pins or sheet pins connected
+        if pins.is_empty() && sheet_pins.is_empty() {
             continue;
         }
 
-        // Determine net name
-        let (net_name, is_global) = match label_name {
-            Some((name, is_global)) => (name, is_global),
+        // Determine net name and scope
+        let (net_name, scope) = match label_info {
+            Some((name, scope)) => (name, scope),
             None => {
-                // Auto-generate net name
+                // Auto-generate net name - local scope
                 let name = format!("NET_{}", auto_net_counter);
                 auto_net_counter += 1;
-                (name, false)
+                (name, NetLabelScope::Local)
             }
         };
+        let is_global = scope == NetLabelScope::Global;
 
         // Map pins to net
         for (ref_, pin) in &pins {
             pin_to_net.insert((ref_.clone(), pin.clone()), net_name.clone());
         }
 
-        // Build connections list
-        let connections: Vec<String> = pins.iter().map(|(r, p)| format!("{}:{}", r, p)).collect();
+        // Build connections list (component pins + sheet pins)
+        let mut connections: Vec<String> = pins.iter().map(|(r, p)| format!("{}:{}", r, p)).collect();
+        for (sheet, pin) in &sheet_pins {
+            connections.push(format!("{}:{}", sheet, pin));
+        }
 
         nets.push(NetInfo {
             name: net_name,
             is_global,
+            scope,
             connections,
         });
     }
@@ -542,11 +596,15 @@ enum ConnectionKind {
         pin_number: String,
         pin_name: String, // Kept for potential future use (e.g., named net assignment)
     },
+    SheetPin {
+        sheet_name: String,
+        pin_name: String,
+    },
     WireEndpoint,
     Junction,
     Label {
         name: String,
-        is_global: bool,
+        scope: NetLabelScope,
     },
 }
 

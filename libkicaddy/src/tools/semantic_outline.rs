@@ -20,6 +20,7 @@ pub enum ComponentType {
     IC,
     Connector,
     Relay,
+    Switch,
     Other,
 }
 
@@ -54,6 +55,8 @@ impl ComponentType {
                     ComponentType::Connector
                 } else if lib_id.starts_with("Relay:") {
                     ComponentType::Relay
+                } else if lib_id.starts_with("Switch:") {
+                    ComponentType::Switch
                 } else {
                     ComponentType::Other
                 }
@@ -69,6 +72,17 @@ impl ComponentType {
         )
     }
 
+    /// Check if this is a 2-pin component that can be merged into nets
+    pub fn is_two_pin_mergeable(&self) -> bool {
+        matches!(
+            self,
+            ComponentType::Resistor
+                | ComponentType::Capacitor { .. }
+                | ComponentType::Inductor
+                | ComponentType::Switch
+        )
+    }
+
     /// Check if this is a polarized capacitor
     pub fn is_polarized_cap(&self) -> bool {
         matches!(self, ComponentType::Capacitor { polarized: true })
@@ -81,6 +95,18 @@ pub enum NetType {
     Power,
     Ground,
     Signal,
+}
+
+/// Net label scope - determines the visibility/reach of a net
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetScope {
+    /// Global scope - visible across all sheets (from global_label or power symbols)
+    #[default]
+    Global,
+    /// Hierarchical scope - connects parent/child sheets (from hierarchical_label)
+    Hierarchical,
+    /// Local scope - only visible within current sheet (from label)
+    Local,
 }
 
 impl NetType {
@@ -114,10 +140,39 @@ impl NetType {
 /// What a merged passive component connects to on its "other" side
 #[derive(Debug, Clone, PartialEq)]
 pub enum MergedTarget {
-    /// Connected to a net (power, ground, or signal)
-    Net(String),
+    /// Connected to a net (power, ground, or signal) with scope
+    Net { name: String, scope: NetScope },
     /// Connected to a single component pin
     Pin { reference: String, pin: String },
+    /// Connected to another merged component (for series chains)
+    Merged(Box<SemanticConnection>),
+}
+
+impl MergedTarget {
+    fn is_ground(&self) -> bool {
+        matches!(self, MergedTarget::Net { name, .. } if NetType::classify(name).is_ground())
+    }
+
+    fn is_power(&self) -> bool {
+        matches!(self, MergedTarget::Net { name, .. } if NetType::classify(name).is_power())
+    }
+}
+
+impl fmt::Display for MergedTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MergedTarget::Net { name, scope } => {
+                let prefix = match scope {
+                    NetScope::Global => '&',
+                    NetScope::Hierarchical => '^',
+                    NetScope::Local => '!',
+                };
+                write!(f, "{}{}", prefix, name)
+            }
+            MergedTarget::Pin { reference, pin } => write!(f, "{}:{}", reference, pin),
+            MergedTarget::Merged(inner) => write!(f, "{}", inner),
+        }
+    }
 }
 
 /// A semantic connection endpoint
@@ -125,8 +180,8 @@ pub enum MergedTarget {
 pub enum SemanticConnection {
     /// Regular pin reference (e.g., "U1:GPIO0")
     Pin { reference: String, pin: String },
-    /// Net label (e.g., "&VCC")
-    Net(String),
+    /// Net label with scope (e.g., "&VCC" for global, "^GPIO0" for hierarchical, "!SIGNAL" for local)
+    Net { name: String, scope: NetScope },
     /// Merged resistor - specialized in Display based on target
     MergedResistor {
         reference: String,
@@ -140,45 +195,43 @@ pub enum SemanticConnection {
         polarized: bool,
         target: MergedTarget,
     },
+    /// Merged switch
+    MergedSwitch {
+        reference: String,
+        target: MergedTarget,
+    },
 }
 
 impl fmt::Display for SemanticConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SemanticConnection::Pin { reference, pin } => write!(f, "{}:{}", reference, pin),
-            SemanticConnection::Net(name) => write!(f, "&{}", name),
+            SemanticConnection::Net { name, scope } => {
+                let prefix = match scope {
+                    NetScope::Global => '&',
+                    NetScope::Hierarchical => '^',
+                    NetScope::Local => '!',
+                };
+                write!(f, "{}{}", prefix, name)
+            }
             SemanticConnection::MergedResistor { reference, value, target } => {
-                match target {
-                    MergedTarget::Net(net) => {
-                        let net_type = NetType::classify(net);
-                        if net_type.is_power() {
-                            write!(f, "$PULLUP({}, {}, &{})", reference, value, net)
-                        } else if net_type.is_ground() {
-                            write!(f, "$PULLDOWN({}, {})", reference, value)
-                        } else {
-                            write!(f, "$RESISTOR({}, {}, &{})", reference, value, net)
-                        }
-                    }
-                    MergedTarget::Pin { reference: pin_ref, pin } => {
-                        write!(f, "$RESISTOR({}, {}, {}:{})", reference, value, pin_ref, pin)
-                    }
+                if target.is_power() {
+                    write!(f, "$PULLUP({}, {}, {})", reference, value, target)
+                } else if target.is_ground() {
+                    write!(f, "$PULLDOWN({}, {})", reference, value)
+                } else {
+                    write!(f, "$RESISTOR({}, {}, {})", reference, value, target)
                 }
             }
             SemanticConnection::MergedCapacitor { reference, value, polarized, target } => {
-                let suffix = if *polarized { ", P" } else { "" };
-                match target {
-                    MergedTarget::Net(net) => {
-                        let net_type = NetType::classify(net);
-                        if net_type.is_ground() {
-                            write!(f, "$DECAP({}, {}{})", reference, value, suffix)
-                        } else {
-                            write!(f, "$CAPACITOR({}, {}, &{}{})", reference, value, net, suffix)
-                        }
-                    }
-                    MergedTarget::Pin { reference: pin_ref, pin } => {
-                        write!(f, "$CAPACITOR({}, {}, {}:{}{})", reference, value, pin_ref, pin, suffix)
-                    }
+                if *polarized {
+                    write!(f, "$CAPACITOR_POL({}, {}, {})", reference, value, target)
+                } else {
+                    write!(f, "$CAPACITOR({}, {}, {})", reference, value, target)
                 }
+            }
+            SemanticConnection::MergedSwitch { reference, target } => {
+                write!(f, "$SWITCH({}, {})", reference, target)
             }
         }
     }
@@ -215,11 +268,24 @@ pub struct SemanticComponent {
     pub component_type: ComponentType,
 }
 
+/// A sheet (sub-schematic) in the semantic outline
+#[derive(Debug, Clone)]
+pub struct SemanticSheet {
+    /// Sheet name (e.g., "Power", "RP2040")
+    pub name: String,
+    /// Sheet file path (e.g., "power.kicad_sch")
+    pub file: String,
+    /// Pin names on this sheet
+    pub pins: Vec<String>,
+}
+
 /// The complete semantic outline of a schematic
 #[derive(Debug, Clone)]
 pub struct SemanticOutline {
     /// Components (excluding absorbed passives)
     pub components: Vec<SemanticComponent>,
+    /// Sheets (sub-schematics) referenced by this schematic
+    pub sheets: Vec<SemanticSheet>,
     /// Connections with semantic annotations
     pub connections: Vec<ProcessedNet>,
     /// References of components that were absorbed into semantic patterns
@@ -294,6 +360,20 @@ impl SemanticOutline {
             }
         }
 
+        // Sheets section (if any)
+        if !self.sheets.is_empty() {
+            lines.push(String::new());
+            lines.push("Sheets:".to_string());
+
+            for sheet in &self.sheets {
+                lines.push(format!("  {}", sheet.name));
+                lines.push(format!("    File: {}", sheet.file));
+                if !sheet.pins.is_empty() {
+                    lines.push(format!("    Pins: {}", sheet.pins.join(" ")));
+                }
+            }
+        }
+
         lines.push(String::new());
         lines.push("Connections:".to_string());
         lines.push(String::new());
@@ -313,6 +393,7 @@ struct ComponentData {
     lib_id: String,
     value: String,
     pins: Vec<String>,
+    pin_num_to_name: HashMap<String, String>,
     description: Option<String>,
     component_type: ComponentType,
 }
@@ -322,6 +403,8 @@ struct ComponentData {
 struct NetData {
     /// Net name (if any)
     name: Option<String>,
+    /// Net scope
+    scope: NetScope,
     /// Pin connections as (reference, pin)
     pins: Vec<(String, String)>,
 }
@@ -360,27 +443,34 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
 
         let component_type = ComponentType::classify(&reference, &symbol.lib_id);
 
-        // Get pin names from lib_symbol
+        // Get pin names from lib_symbol and build number→name mapping
         let lib_symbol = schematic.lib_symbols.iter().find(|s| s.name == symbol.lib_id);
-        let pins: Vec<String> = if let Some(lib_sym) = lib_symbol {
-            let mut pin_names: Vec<String> = lib_sym
-                .units
-                .iter()
-                .flat_map(|u| u.pins.iter())
-                .map(|p| {
+        let (pins, pin_num_to_name): (Vec<String>, HashMap<String, String>) = if let Some(lib_sym) = lib_symbol {
+            let mut pin_names: Vec<String> = Vec::new();
+            let mut num_to_name: HashMap<String, String> = HashMap::new();
+
+            for unit in &lib_sym.units {
+                for p in &unit.pins {
                     // Prefer pin name over number if name is meaningful
-                    if p.name.name != "~" && !p.name.name.is_empty() {
+                    let name = if p.name.name != "~" && !p.name.name.is_empty() {
                         p.name.name.clone()
                     } else {
                         p.number.number.clone()
-                    }
-                })
-                .collect();
+                    };
+                    pin_names.push(name.clone());
+                    num_to_name.insert(p.number.number.clone(), name);
+                }
+            }
+
             pin_names.sort();
             pin_names.dedup();
-            pin_names
+            (pin_names, num_to_name)
         } else {
-            symbol.pins.iter().map(|p| p.number.clone()).collect()
+            let pins: Vec<String> = symbol.pins.iter().map(|p| p.number.clone()).collect();
+            let num_to_name: HashMap<String, String> = symbol.pins.iter()
+                .map(|p| (p.number.clone(), p.number.clone()))
+                .collect();
+            (pins, num_to_name)
         };
 
         components.insert(reference.clone(), ComponentData {
@@ -388,6 +478,7 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
             lib_id: symbol.lib_id.clone(),
             value,
             pins,
+            pin_num_to_name,
             description,
             component_type,
         });
@@ -396,7 +487,16 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
     // Step 2: Build connectivity using the existing outline logic
     let raw_outline = super::outline::build_outline(schematic);
 
-    // Step 3: Build net data from raw outline
+    // Helper to convert pin number to pin name
+    let pin_name = |reference: &str, pin_num: &str| -> String {
+        components
+            .get(reference)
+            .and_then(|c| c.pin_num_to_name.get(pin_num))
+            .cloned()
+            .unwrap_or_else(|| pin_num.to_string())
+    };
+
+    // Step 3: Build net data from raw outline (converting pin numbers to names)
     let mut net_data: Vec<NetData> = Vec::new();
     for net in &raw_outline.nets {
         let pins: Vec<(String, String)> = net
@@ -405,185 +505,258 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
             .filter_map(|conn| {
                 let parts: Vec<&str> = conn.split(':').collect();
                 if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
+                    let reference = parts[0];
+                    let pin_num = parts[1];
+                    Some((reference.to_string(), pin_name(reference, pin_num)))
                 } else {
                     None
                 }
             })
             .collect();
 
+        // Convert NetLabelScope to NetScope
+        let scope = match net.scope {
+            super::outline::NetLabelScope::Global => NetScope::Global,
+            super::outline::NetLabelScope::Hierarchical => NetScope::Hierarchical,
+            super::outline::NetLabelScope::Local => NetScope::Local,
+        };
+
         net_data.push(NetData {
             name: Some(net.name.clone()),
+            scope,
             pins,
         });
     }
 
-    // Step 4: Pattern recognition - identify pullups, pulldowns, decoupling caps
+    // Step 4: Multi-pass merging of 2-pin components
+    //
+    // Pass 1: Collect all potential merge candidates with their raw targets
+    // Pass 2: Loop until no changes - resolve nested targets (e.g., R9 -> SW2 -> GND becomes R9 -> $SWITCH(SW2, GND))
+    // Pass 3: Build final ProcessedNet structures
+
+    // Track which components are absorbed (merged into annotations)
     let mut absorbed: HashSet<String> = HashSet::new();
-    let mut semantic_nets: Vec<ProcessedNet> = Vec::new();
 
-    for net in &net_data {
-        let mut endpoints: Vec<SemanticConnection> = Vec::new();
-        let mut absorbed_in_this_net: Vec<String> = Vec::new();
+    // Merge candidate: (SemanticConnection with raw target, net_index where it appears)
+    #[derive(Debug, Clone)]
+    struct MergeCandidate {
+        connection: SemanticConnection,
+        net_idx: usize,
+    }
 
-        // Separate pins by component type
-        let mut passive_pins: Vec<(&String, &String)> = Vec::new();
-        let mut active_pins: Vec<(&String, &String)> = Vec::new();
+    let mut merge_candidates: HashMap<String, MergeCandidate> = HashMap::new();
 
-        for (ref_, pin) in &net.pins {
-            if let Some(comp) = components.get(ref_) {
-                if comp.component_type.is_two_pin_passive() {
-                    passive_pins.push((ref_, pin));
-                } else {
-                    active_pins.push((ref_, pin));
-                }
-            }
-        }
-
-        // Determine net type for this net
+    // Pass 1: Identify all merge candidates
+    for (net_idx, net) in net_data.iter().enumerate() {
         let net_type = net.name.as_ref().map(|n| NetType::classify(n));
 
-        // Process 2-pin passives for merging
-        // Rules for merging:
-        // 1. If the OTHER net is power/ground, merge into THIS net (power/ground acts as sink)
-        // 2. Otherwise, merge into the "larger" net (the one with more than just passive + 1 other pin)
-        for (ref_, _pin) in &passive_pins {
-            if absorbed.contains(*ref_) {
+        for (ref_, _pin) in &net.pins {
+            let comp = match components.get(ref_.as_str()) {
+                Some(c) if c.component_type.is_two_pin_mergeable() => c,
+                _ => continue,
+            };
+
+            // Skip if already processed
+            if merge_candidates.contains_key(ref_.as_str()) {
                 continue;
             }
 
-            let comp = match components.get(*ref_) {
-                Some(c) => c,
+            // Get info about the other net this component connects to
+            let other_info = match find_other_pin_net_info(&net_data, ref_, net.name.as_deref()) {
+                Some(info) => info,
                 None => continue,
             };
 
-            // Get info about the other net this passive connects to
-            let other_info = find_other_pin_net_info(&net_data, ref_, net.name.as_deref());
+            let other_type = NetType::classify(&other_info.net_name);
+            let this_is_power_ground = net_type.map(|t| t.is_power() || t.is_ground()).unwrap_or(false);
+            let other_is_power_ground = other_type.is_power() || other_type.is_ground();
+            let this_is_ground = net_type.map(|t| t.is_ground()).unwrap_or(false);
+            let other_is_ground = other_type.is_ground();
 
-            if let Some(info) = other_info {
-                let other_type = NetType::classify(&info.net_name);
+            // Determine if we should merge this component into THIS net
+            // Priority: always merge AWAY from power/ground nets
+            let should_merge_here = if this_is_power_ground && !other_is_power_ground {
+                false // THIS net is power/ground, other is not - don't merge here
+            } else if other_is_power_ground && !this_is_power_ground {
+                true // Other net is power/ground - merge into THIS net
+            } else if this_is_ground && other_is_power_ground && !other_is_ground {
+                false // Both power/ground, but THIS is GND and other is power - merge there
+            } else if other_is_ground && this_is_power_ground && !this_is_ground {
+                true // Both power/ground, but other is GND - merge here
+            } else if other_info.single_other_pin.is_some() {
+                true // Other net is "small" (component + 1 other pin) - merge here
+            } else {
+                false
+            };
 
-                let this_is_power_ground = net_type.map(|t| t.is_power() || t.is_ground()).unwrap_or(false);
-                let other_is_power_ground = other_type.is_power() || other_type.is_ground();
-                let this_is_ground = net_type.map(|t| t.is_ground()).unwrap_or(false);
-                let other_is_ground = other_type.is_ground();
-
-                // Check if we should merge this passive into THIS net
-                // Priority: always merge AWAY from power/ground nets, prefer non-GND over non-power
-                let should_merge_here = if this_is_power_ground && !other_is_power_ground {
-                    // THIS net is power/ground, other is not - don't merge here
-                    false
-                } else if other_is_power_ground && !this_is_power_ground {
-                    // Other net is power/ground - merge into THIS net
-                    true
-                } else if this_is_ground && other_is_power_ground && !other_is_ground {
-                    // Both are power/ground, but THIS is GND and other is power - merge to other
-                    false
-                } else if other_is_ground && this_is_power_ground && !this_is_ground {
-                    // Both are power/ground, but other is GND and THIS is power - merge here
-                    true
-                } else if let Some(ref _target_str) = info.single_other_pin {
-                    // Use "small net" logic - other net has only passive + 1 other pin
-                    true
-                } else {
-                    false
-                };
-
-                if should_merge_here {
-                    // Determine the target - either a net name or the single other pin
-                    let target = if other_type.is_power() || other_type.is_ground() {
-                        MergedTarget::Net(info.net_name.clone())
-                    } else if let Some(ref target_str) = info.single_other_pin {
-                        parse_merged_target(target_str, &info.net_name)
-                    } else {
-                        continue;
-                    };
-
-                    match comp.component_type {
-                        ComponentType::Resistor => {
-                            endpoints.push(SemanticConnection::MergedResistor {
-                                reference: ref_.to_string(),
-                                value: comp.value.clone(),
-                                target,
-                            });
-                            absorbed_in_this_net.push(ref_.to_string());
-                        }
-                        ComponentType::Capacitor { polarized } => {
-                            endpoints.push(SemanticConnection::MergedCapacitor {
-                                reference: ref_.to_string(),
-                                value: comp.value.clone(),
-                                polarized,
-                                target,
-                            });
-                            absorbed_in_this_net.push(ref_.to_string());
-                        }
-                        _ => {}
-                    }
-                }
+            if !should_merge_here {
+                continue;
             }
-        }
 
-        // Add non-absorbed passive pins as regular pin connections
-        for (ref_, pin) in &passive_pins {
-            if !absorbed.contains(*ref_) && !absorbed_in_this_net.contains(*ref_) {
-                // Check if this passive will be absorbed on the OTHER net
-                let should_skip = if let Some(info) = find_other_pin_net_info(&net_data, ref_, net.name.as_deref()) {
-                    let other_type = NetType::classify(&info.net_name);
-                    let this_is_power_ground = net_type.map(|t| t.is_power() || t.is_ground()).unwrap_or(false);
-                    let other_is_power_ground = other_type.is_power() || other_type.is_ground();
-                    let this_is_ground = net_type.map(|t| t.is_ground()).unwrap_or(false);
-                    let other_is_ground = other_type.is_ground();
+            // Determine the raw target
+            let target = if other_is_power_ground {
+                MergedTarget::Net { name: other_info.net_name.clone(), scope: other_info.scope }
+            } else if let Some(ref target_str) = other_info.single_other_pin {
+                parse_merged_target(target_str, &other_info.net_name, other_info.scope)
+            } else {
+                continue;
+            };
 
-                    // Skip if this net is power/ground and other is not (will be merged there)
-                    if this_is_power_ground && !other_is_power_ground {
-                        true
-                    }
-                    // Skip if this is GND and other is power (will be merged there)
-                    else if this_is_ground && other_is_power_ground && !other_is_ground {
-                        true
-                    }
-                    // Skip if this net is "small" (passive + only 1 other pin)
-                    else if net.pins.len() == 2 {
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+            // Create the merge candidate
+            let connection = match comp.component_type {
+                ComponentType::Resistor => SemanticConnection::MergedResistor {
+                    reference: ref_.to_string(),
+                    value: comp.value.clone(),
+                    target,
+                },
+                ComponentType::Capacitor { polarized } => SemanticConnection::MergedCapacitor {
+                    reference: ref_.to_string(),
+                    value: comp.value.clone(),
+                    polarized,
+                    target,
+                },
+                ComponentType::Switch => SemanticConnection::MergedSwitch {
+                    reference: ref_.to_string(),
+                    target,
+                },
+                _ => continue,
+            };
 
-                if !should_skip {
-                    endpoints.push(SemanticConnection::Pin {
-                        reference: ref_.to_string(),
-                        pin: pin.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Add active component pins
-        for (ref_, pin) in &active_pins {
-            endpoints.push(SemanticConnection::Pin {
-                reference: ref_.to_string(),
-                pin: pin.to_string(),
+            merge_candidates.insert(ref_.to_string(), MergeCandidate {
+                connection,
+                net_idx,
             });
+            absorbed.insert(ref_.to_string());
         }
+    }
 
-        // Add net label
-        if let Some(name) = &net.name {
-            // Only add net label if it's not an auto-generated name
-            if !name.starts_with("NET_") {
-                endpoints.push(SemanticConnection::Net(name.clone()));
+    // Pass 2: Resolve nested targets (loop until no changes)
+    // If a candidate's target is a Pin of another candidate, nest it
+    loop {
+        let mut changed = false;
+
+        // Collect updates to apply (can't mutate while iterating)
+        let mut updates: Vec<(String, SemanticConnection)> = Vec::new();
+
+        for (ref_, candidate) in &merge_candidates {
+            let target_ref = match &candidate.connection {
+                SemanticConnection::MergedResistor { target: MergedTarget::Pin { reference, .. }, .. } => reference,
+                SemanticConnection::MergedCapacitor { target: MergedTarget::Pin { reference, .. }, .. } => reference,
+                SemanticConnection::MergedSwitch { target: MergedTarget::Pin { reference, .. }, .. } => reference,
+                _ => continue,
+            };
+
+            // Check if target is another merge candidate
+            if let Some(nested_candidate) = merge_candidates.get(target_ref) {
+                // Don't nest if the nested candidate also points to us (cycle)
+                let nested_points_to_us = match &nested_candidate.connection {
+                    SemanticConnection::MergedResistor { target: MergedTarget::Pin { reference, .. }, .. } => reference == ref_,
+                    SemanticConnection::MergedCapacitor { target: MergedTarget::Pin { reference, .. }, .. } => reference == ref_,
+                    SemanticConnection::MergedSwitch { target: MergedTarget::Pin { reference, .. }, .. } => reference == ref_,
+                    _ => false,
+                };
+
+                if nested_points_to_us {
+                    continue;
+                }
+
+                // Create nested version
+                let nested_target = MergedTarget::Merged(Box::new(nested_candidate.connection.clone()));
+
+                let new_connection = match &candidate.connection {
+                    SemanticConnection::MergedResistor { reference, value, .. } => {
+                        SemanticConnection::MergedResistor {
+                            reference: reference.clone(),
+                            value: value.clone(),
+                            target: nested_target,
+                        }
+                    }
+                    SemanticConnection::MergedCapacitor { reference, value, polarized, .. } => {
+                        SemanticConnection::MergedCapacitor {
+                            reference: reference.clone(),
+                            value: value.clone(),
+                            polarized: *polarized,
+                            target: nested_target,
+                        }
+                    }
+                    SemanticConnection::MergedSwitch { reference, .. } => {
+                        SemanticConnection::MergedSwitch {
+                            reference: reference.clone(),
+                            target: nested_target,
+                        }
+                    }
+                    _ => continue,
+                };
+
+                updates.push((ref_.clone(), new_connection));
+                changed = true;
             }
         }
 
-        // Record absorbed components
-        for ref_ in absorbed_in_this_net {
-            absorbed.insert(ref_);
+        // Apply updates
+        for (ref_, new_connection) in updates {
+            if let Some(candidate) = merge_candidates.get_mut(&ref_) {
+                candidate.connection = new_connection;
+            }
         }
 
-        // Only add net if it has at least 2 meaningful endpoints
-        // (a single pin alone is not useful - it was likely absorbed into another net)
+        if !changed {
+            break;
+        }
+    }
+
+    // Find which candidates are nested inside others (should not appear at top level)
+    let nested_refs: HashSet<String> = merge_candidates
+        .values()
+        .filter_map(|c| {
+            match &c.connection {
+                SemanticConnection::MergedResistor { target: MergedTarget::Merged(inner), .. } |
+                SemanticConnection::MergedCapacitor { target: MergedTarget::Merged(inner), .. } |
+                SemanticConnection::MergedSwitch { target: MergedTarget::Merged(inner), .. } => {
+                    // Extract the reference from the nested connection
+                    match inner.as_ref() {
+                        SemanticConnection::MergedResistor { reference, .. } |
+                        SemanticConnection::MergedCapacitor { reference, .. } |
+                        SemanticConnection::MergedSwitch { reference, .. } => Some(reference.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Pass 3: Build final ProcessedNet structures
+    let mut semantic_nets: Vec<ProcessedNet> = Vec::new();
+
+    for (net_idx, net) in net_data.iter().enumerate() {
+        let mut endpoints: Vec<SemanticConnection> = Vec::new();
+
+        // Add merged components that belong to this net (and aren't nested inside others)
+        for (ref_, candidate) in &merge_candidates {
+            if candidate.net_idx == net_idx && !nested_refs.contains(ref_) {
+                endpoints.push(candidate.connection.clone());
+            }
+        }
+
+        // Add non-absorbed component pins
+        for (ref_, pin) in &net.pins {
+            if !absorbed.contains(ref_.as_str()) {
+                endpoints.push(SemanticConnection::Pin {
+                    reference: ref_.to_string(),
+                    pin: pin.to_string(),
+                });
+            }
+        }
+
+        // Add net label (if not auto-generated)
+        if let Some(name) = &net.name {
+            if !name.starts_with("NET_") {
+                endpoints.push(SemanticConnection::Net { name: name.clone(), scope: net.scope });
+            }
+        }
+
+        // Only add nets with at least 2 endpoints
         if endpoints.len() >= 2 {
             semantic_nets.push(ProcessedNet { endpoints });
         }
@@ -624,7 +797,7 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
     semantic_nets.sort_by(|a, b| {
         let get_sort_key = |net: &ProcessedNet| -> String {
             for ep in &net.endpoints {
-                if let SemanticConnection::Net(name) = ep {
+                if let SemanticConnection::Net { name, .. } = ep {
                     return name.clone();
                 }
             }
@@ -639,8 +812,26 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
         get_sort_key(a).cmp(&get_sort_key(b))
     });
 
+    // Step 6: Build sheets list
+    let mut sheets: Vec<SemanticSheet> = schematic
+        .sheets
+        .iter()
+        .map(|sheet| {
+            let pins: Vec<String> = sheet.pins.iter().map(|p| p.name.clone()).collect();
+            SemanticSheet {
+                name: sheet.sheet_name.clone(),
+                file: sheet.sheet_file.clone(),
+                pins,
+            }
+        })
+        .collect();
+
+    // Sort sheets by name
+    sheets.sort_by(|a, b| a.name.cmp(&b.name));
+
     SemanticOutline {
         components: final_components,
+        sheets,
         connections: semantic_nets,
         absorbed_components: absorbed,
     }
@@ -650,19 +841,21 @@ pub fn build_semantic_outline(schematic: &Schematic) -> SemanticOutline {
 struct OtherNetInfo {
     /// Name of the other net
     net_name: String,
+    /// Net scope
+    scope: NetScope,
     /// If there's exactly one other pin (not this component), its "ref:pin" string
     single_other_pin: Option<String>,
 }
 
-/// Parse a merged target from a "ref:pin" string and net name
+/// Parse a merged target from a "ref:pin" string and net name/scope
 /// If the target is a power symbol (starts with #), use the net name instead
-fn parse_merged_target(pin_str: &str, net_name: &str) -> MergedTarget {
+fn parse_merged_target(pin_str: &str, net_name: &str, scope: NetScope) -> MergedTarget {
     let parts: Vec<&str> = pin_str.split(':').collect();
     if parts.len() == 2 {
         let reference = parts[0];
         // Power symbols start with # - use the net name instead
         if reference.starts_with('#') {
-            MergedTarget::Net(net_name.to_string())
+            MergedTarget::Net { name: net_name.to_string(), scope }
         } else {
             MergedTarget::Pin {
                 reference: reference.to_string(),
@@ -671,7 +864,7 @@ fn parse_merged_target(pin_str: &str, net_name: &str) -> MergedTarget {
         }
     } else {
         // Fallback to net name
-        MergedTarget::Net(net_name.to_string())
+        MergedTarget::Net { name: net_name.to_string(), scope }
     }
 }
 
@@ -698,6 +891,7 @@ fn find_other_pin_net_info(nets: &[NetData], reference: &str, current_net: Optio
 
             return Some(OtherNetInfo {
                 net_name: net.name.clone().unwrap_or_default(),
+                scope: net.scope,
                 single_other_pin,
             });
         }
@@ -759,14 +953,23 @@ mod tests {
         };
         assert_eq!(pin.to_string(), "U1:GPIO0");
 
-        let net = SemanticConnection::Net("VCC".to_string());
+        // Global net
+        let net = SemanticConnection::Net { name: "VCC".to_string(), scope: NetScope::Global };
         assert_eq!(net.to_string(), "&VCC");
+
+        // Hierarchical net
+        let hier_net = SemanticConnection::Net { name: "GPIO0".to_string(), scope: NetScope::Hierarchical };
+        assert_eq!(hier_net.to_string(), "^GPIO0");
+
+        // Local net
+        let local_net = SemanticConnection::Net { name: "SIGNAL".to_string(), scope: NetScope::Local };
+        assert_eq!(local_net.to_string(), "!SIGNAL");
 
         // Pullup: resistor to power net
         let pullup = SemanticConnection::MergedResistor {
             reference: "R1".to_string(),
             value: "10k".to_string(),
-            target: MergedTarget::Net("VCC".to_string()),
+            target: MergedTarget::Net { name: "VCC".to_string(), scope: NetScope::Global },
         };
         assert_eq!(pullup.to_string(), "$PULLUP(R1, 10k, &VCC)");
 
@@ -774,7 +977,7 @@ mod tests {
         let pulldown = SemanticConnection::MergedResistor {
             reference: "R2".to_string(),
             value: "10k".to_string(),
-            target: MergedTarget::Net("GND".to_string()),
+            target: MergedTarget::Net { name: "GND".to_string(), scope: NetScope::Global },
         };
         assert_eq!(pulldown.to_string(), "$PULLDOWN(R2, 10k)");
 
@@ -786,31 +989,70 @@ mod tests {
         };
         assert_eq!(series.to_string(), "$RESISTOR(R3, 100, U1:TX)");
 
-        // Decoupling cap to ground
-        let decap = SemanticConnection::MergedCapacitor {
+        // Non-polarized capacitor to ground
+        let cap_gnd = SemanticConnection::MergedCapacitor {
             reference: "C1".to_string(),
             value: "100nF".to_string(),
             polarized: false,
-            target: MergedTarget::Net("GND".to_string()),
+            target: MergedTarget::Net { name: "GND".to_string(), scope: NetScope::Global },
         };
-        assert_eq!(decap.to_string(), "$DECAP(C1, 100nF)");
+        assert_eq!(cap_gnd.to_string(), "$CAPACITOR(C1, 100nF, &GND)");
 
-        // Polarized decoupling cap
-        let decap_polar = SemanticConnection::MergedCapacitor {
+        // Polarized capacitor to ground
+        let cap_polar_gnd = SemanticConnection::MergedCapacitor {
             reference: "C2".to_string(),
             value: "10uF".to_string(),
             polarized: true,
-            target: MergedTarget::Net("GND".to_string()),
+            target: MergedTarget::Net { name: "GND".to_string(), scope: NetScope::Global },
         };
-        assert_eq!(decap_polar.to_string(), "$DECAP(C2, 10uF, P)");
+        assert_eq!(cap_polar_gnd.to_string(), "$CAPACITOR_POL(C2, 10uF, &GND)");
 
-        // Capacitor to power net (not ground)
+        // Non-polarized capacitor to power net
         let cap_power = SemanticConnection::MergedCapacitor {
             reference: "C3".to_string(),
             value: "1uF".to_string(),
             polarized: false,
-            target: MergedTarget::Net("VCC".to_string()),
+            target: MergedTarget::Net { name: "VCC".to_string(), scope: NetScope::Global },
         };
         assert_eq!(cap_power.to_string(), "$CAPACITOR(C3, 1uF, &VCC)");
+
+        // Switch to ground
+        let switch_gnd = SemanticConnection::MergedSwitch {
+            reference: "SW1".to_string(),
+            target: MergedTarget::Net { name: "GND".to_string(), scope: NetScope::Global },
+        };
+        assert_eq!(switch_gnd.to_string(), "$SWITCH(SW1, &GND)");
+
+        // Switch to a pin
+        let switch_pin = SemanticConnection::MergedSwitch {
+            reference: "SW2".to_string(),
+            target: MergedTarget::Pin { reference: "U1".to_string(), pin: "RESET".to_string() },
+        };
+        assert_eq!(switch_pin.to_string(), "$SWITCH(SW2, U1:RESET)");
+
+        // Nested merge: resistor -> switch -> ground
+        // This represents a series chain: R9 connects to SW2, SW2 connects to GND
+        let nested = SemanticConnection::MergedResistor {
+            reference: "R9".to_string(),
+            value: "1K".to_string(),
+            target: MergedTarget::Merged(Box::new(SemanticConnection::MergedSwitch {
+                reference: "SW2".to_string(),
+                target: MergedTarget::Net { name: "GND".to_string(), scope: NetScope::Global },
+            })),
+        };
+        assert_eq!(nested.to_string(), "$RESISTOR(R9, 1K, $SWITCH(SW2, &GND))");
+
+        // Nested merge: capacitor -> resistor -> pin
+        let nested_cap = SemanticConnection::MergedCapacitor {
+            reference: "C1".to_string(),
+            value: "100nF".to_string(),
+            polarized: false,
+            target: MergedTarget::Merged(Box::new(SemanticConnection::MergedResistor {
+                reference: "R1".to_string(),
+                value: "10k".to_string(),
+                target: MergedTarget::Pin { reference: "U1".to_string(), pin: "VDD".to_string() },
+            })),
+        };
+        assert_eq!(nested_cap.to_string(), "$CAPACITOR(C1, 100nF, $RESISTOR(R1, 10k, U1:VDD))");
     }
 }

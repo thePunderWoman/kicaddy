@@ -99,6 +99,8 @@ pub struct Schematic {
     pub text_items: Vec<TextItem>,
     /// Placed symbol instances
     pub symbols: Vec<SymbolInstance>,
+    /// Sheet symbols (hierarchical sub-schematic references)
+    pub sheets: Vec<Sheet>,
     /// Sheet instances (for hierarchical designs)
     pub sheet_instances: Vec<SheetInstance>,
     /// Whether to embed fonts
@@ -129,6 +131,7 @@ impl Schematic {
             labels: Vec::new(),
             text_items: Vec::new(),
             symbols: Vec::new(),
+            sheets: Vec::new(),
             // Root sheet instance is required
             sheet_instances: vec![SheetInstance {
                 path: "/".to_string(),
@@ -1021,6 +1024,46 @@ impl Mirror {
             Mirror::Y => "y",
         }
     }
+}
+
+/// A pin on a sheet symbol (hierarchical connection point)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SheetPin {
+    /// Pin name (the hierarchical label text)
+    pub name: String,
+    /// Pin shape (input, output, bidirectional, etc.)
+    pub shape: LabelShape,
+    /// Position in schematic coordinates
+    pub position: Position,
+    /// Unique identifier
+    pub uuid: String,
+}
+
+/// A sheet symbol (reference to sub-schematic)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sheet {
+    /// Position in schematic coordinates
+    pub position: Position,
+    /// Size (width, height)
+    pub size: (f64, f64),
+    /// Unique identifier
+    pub uuid: String,
+    /// Sheet name (from "Sheetname" property)
+    pub sheet_name: String,
+    /// Sheet file path (from "Sheetfile" property)
+    pub sheet_file: String,
+    /// Connection pins on this sheet
+    pub pins: Vec<SheetPin>,
+    /// DNP flag
+    pub dnp: bool,
+    /// Exclude from simulation
+    pub exclude_from_sim: bool,
+    /// Include in BOM
+    pub in_bom: bool,
+    /// Include on board
+    pub on_board: bool,
+    /// Fields autoplaced
+    pub fields_autoplaced: bool,
 }
 
 /// Sheet instance information

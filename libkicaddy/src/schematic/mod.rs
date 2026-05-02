@@ -124,6 +124,8 @@ fn parse_schematic_sexpr(sexpr: &SExpr) -> Result<Schematic, SchematicError> {
             schematic.text_items.push(parse_text_item(item)?);
         } else if item.is_list_starting_with("symbol") {
             schematic.symbols.push(parse_symbol_instance(item)?);
+        } else if item.is_list_starting_with("sheet") {
+            schematic.sheets.push(parse_sheet(item)?);
         } else if item.is_list_starting_with("sheet_instances") {
             schematic.sheet_instances = parse_sheet_instances(item)?;
         } else if let Some(args) = item.as_list_starting_with("embedded_fonts") {
@@ -1285,6 +1287,123 @@ fn parse_project_instances(sexpr: &SExpr) -> Result<Vec<ProjectInstance>, Schema
     }
 
     Ok(instances)
+}
+
+fn parse_sheet(sexpr: &SExpr) -> Result<Sheet, SchematicError> {
+    let items = sexpr.as_list_starting_with("sheet").ok_or_else(|| {
+        SchematicError::InvalidFormat {
+            expected: "sheet".to_string(),
+            got: format!("{:?}", sexpr),
+        }
+    })?;
+
+    let mut position = Position::default();
+    let mut size = (0.0, 0.0);
+    let mut uuid = String::new();
+    let mut sheet_name = String::new();
+    let mut sheet_file = String::new();
+    let mut pins = Vec::new();
+    let mut dnp = false;
+    let mut exclude_from_sim = false;
+    let mut in_bom = true;
+    let mut on_board = true;
+    let mut fields_autoplaced = false;
+
+    for item in items {
+        if let Some(args) = item.as_list_starting_with("at") {
+            let x = args.first().and_then(|e| e.as_number()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|e| e.as_number()).unwrap_or(0.0);
+            // Sheet position doesn't have angle
+            position = Position::new(x, y, 0.0);
+        } else if let Some(args) = item.as_list_starting_with("size") {
+            let w = args.first().and_then(|e| e.as_number()).unwrap_or(0.0);
+            let h = args.get(1).and_then(|e| e.as_number()).unwrap_or(0.0);
+            size = (w, h);
+        } else if let Some(args) = item.as_list_starting_with("uuid") {
+            uuid = args
+                .first()
+                .and_then(|e| e.as_string().or_else(|| e.as_symbol()))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+        } else if item.is_list_starting_with("property") {
+            let prop = parse_property_inner(item).map_err(|e| SchematicError::Parse(e))?;
+            if prop.name == "Sheetname" {
+                sheet_name = prop.value;
+            } else if prop.name == "Sheetfile" {
+                sheet_file = prop.value;
+            }
+        } else if item.is_list_starting_with("pin") {
+            pins.push(parse_sheet_pin(item)?);
+        } else if let Some(args) = item.as_list_starting_with("dnp") {
+            dnp = args.first().and_then(|e| e.as_symbol()) == Some("yes");
+        } else if let Some(args) = item.as_list_starting_with("exclude_from_sim") {
+            exclude_from_sim = args.first().and_then(|e| e.as_symbol()) == Some("yes");
+        } else if let Some(args) = item.as_list_starting_with("in_bom") {
+            in_bom = args.first().and_then(|e| e.as_symbol()) != Some("no");
+        } else if let Some(args) = item.as_list_starting_with("on_board") {
+            on_board = args.first().and_then(|e| e.as_symbol()) != Some("no");
+        } else if item.is_list_starting_with("fields_autoplaced") {
+            fields_autoplaced = true;
+        }
+    }
+
+    Ok(Sheet {
+        position,
+        size,
+        uuid,
+        sheet_name,
+        sheet_file,
+        pins,
+        dnp,
+        exclude_from_sim,
+        in_bom,
+        on_board,
+        fields_autoplaced,
+    })
+}
+
+fn parse_sheet_pin(sexpr: &SExpr) -> Result<SheetPin, SchematicError> {
+    let items = sexpr.as_list_starting_with("pin").ok_or_else(|| {
+        SchematicError::InvalidFormat {
+            expected: "pin (sheet pin)".to_string(),
+            got: format!("{:?}", sexpr),
+        }
+    })?;
+
+    // Sheet pin format: (pin "name" shape (at x y angle) (uuid ...) (effects ...))
+    let name = items
+        .first()
+        .and_then(|e| e.as_string())
+        .ok_or_else(|| SchematicError::MissingField("sheet pin name".to_string()))?
+        .to_string();
+
+    let shape = items
+        .get(1)
+        .and_then(|e| e.as_symbol())
+        .map(LabelShape::from_str)
+        .unwrap_or(LabelShape::Bidirectional);
+
+    let mut position = Position::default();
+    let mut uuid = String::new();
+
+    for item in &items[2..] {
+        if item.is_list_starting_with("at") {
+            position = parse_position_inner(item).map_err(|e| SchematicError::Parse(e))?;
+        } else if let Some(args) = item.as_list_starting_with("uuid") {
+            uuid = args
+                .first()
+                .and_then(|e| e.as_string().or_else(|| e.as_symbol()))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+        }
+    }
+
+    Ok(SheetPin {
+        name,
+        shape,
+        position,
+        uuid,
+    })
 }
 
 fn parse_sheet_instances(sexpr: &SExpr) -> Result<Vec<SheetInstance>, SchematicError> {
