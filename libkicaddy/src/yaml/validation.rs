@@ -156,6 +156,47 @@ pub fn validate_deep(schematic: &YamlSchematic, config: &KicadConfig) -> Validat
                 }
             }
         }
+
+        for pin_ref in &connection.no_connect {
+            let parts: Vec<&str> = pin_ref.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let reference = parts[0];
+            let pin = parts[1];
+
+            if failed_lookups.contains(reference) {
+                continue;
+            }
+
+            if let Some(symbol) = symbols.get(reference) {
+                let pin_exists = symbol
+                    .units
+                    .iter()
+                    .flat_map(|u| u.pins.iter())
+                    .any(|p| pin_matches(pin, &p.number.number, &p.name.name));
+
+                if !pin_exists {
+                    let available: Vec<String> = symbol
+                        .units
+                        .iter()
+                        .flat_map(|u| u.pins.iter())
+                        .map(|p| {
+                            if p.name.name.is_empty() || p.name.name == "~" {
+                                p.number.number.clone()
+                            } else {
+                                format!("{} ({})", p.number.number, p.name.name)
+                            }
+                        })
+                        .collect();
+
+                    result.add_error(YamlError::PinNotFound {
+                        reference: reference.to_string(),
+                        pin: format!("{} - available pins: {}", pin, available.join(", ")),
+                    });
+                }
+            }
+        }
     }
 
     result
@@ -254,15 +295,16 @@ fn validate_connection(
     all_components: &std::collections::HashMap<String, super::types::ComponentDef>,
     result: &mut ValidationResult,
 ) {
-    // Check for minimum endpoints
-    if connection.pins.len() < 2 && connection.net.is_none() {
+    let has_wire_endpoints = connection.pins.len() >= 2 || connection.net.is_some();
+    let has_no_connect = !connection.no_connect.is_empty();
+
+    if !has_wire_endpoints && !has_no_connect {
         result.add_error(YamlError::InsufficientEndpoints {
             connection_index: index,
         });
     }
 
-    // If only 1 pin with a net, it's valid (just attaches a label)
-    if connection.pins.len() < 1 {
+    if connection.pins.is_empty() && connection.net.is_none() && !has_no_connect {
         result.add_error(YamlError::InsufficientEndpoints {
             connection_index: index,
         });
@@ -271,6 +313,9 @@ fn validate_connection(
 
     // Validate each pin reference format and check component exists
     for pin_ref in &connection.pins {
+        validate_pin_reference(pin_ref, all_components, result);
+    }
+    for pin_ref in &connection.no_connect {
         validate_pin_reference(pin_ref, all_components, result);
     }
 }

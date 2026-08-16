@@ -1136,6 +1136,7 @@ fn parse_symbol_instance(sexpr: &SExpr) -> Result<SymbolInstance, SchematicError
     let mut in_bom = true;
     let mut on_board = true;
     let mut dnp = false;
+    let mut power = false;
     let mut fields_autoplaced = false;
     let mut uuid = String::new();
     let mut properties = Vec::new();
@@ -1162,6 +1163,8 @@ fn parse_symbol_instance(sexpr: &SExpr) -> Result<SymbolInstance, SchematicError
             on_board = args.first().and_then(|e| e.as_symbol()) != Some("no");
         } else if let Some(args) = item.as_list_starting_with("dnp") {
             dnp = args.first().and_then(|e| e.as_symbol()) == Some("yes");
+        } else if let Some(args) = item.as_list_starting_with("power") {
+            power = args.first().and_then(|e| e.as_symbol()) == Some("yes");
         } else if item.is_list_starting_with("fields_autoplaced") {
             fields_autoplaced = true;
         } else if let Some(args) = item.as_list_starting_with("uuid") {
@@ -1189,6 +1192,7 @@ fn parse_symbol_instance(sexpr: &SExpr) -> Result<SymbolInstance, SchematicError
         in_bom,
         on_board,
         dnp,
+        power,
         fields_autoplaced,
         uuid,
         properties,
@@ -1665,6 +1669,7 @@ mod tests {
             in_bom: true,
             on_board: true,
             dnp: false,
+            power: false,
             fields_autoplaced: true,
             uuid: "test-uuid".to_string(),
             properties: vec![
@@ -1729,6 +1734,7 @@ mod tests {
                 in_bom: true,
                 on_board: true,
                 dnp: false,
+                power: false,
                 fields_autoplaced: true,
                 uuid: format!("uuid-{}", i),
                 properties: vec![
@@ -1808,6 +1814,7 @@ mod tests {
             in_bom: true,
             on_board: true,
             dnp: false,
+            power: false,
             fields_autoplaced: true,
             uuid: "test-uuid".to_string(),
             properties: vec![
@@ -1879,6 +1886,7 @@ mod tests {
             in_bom: true,
             on_board: true,
             dnp: false,
+            power: false,
             fields_autoplaced: true,
             uuid: "test-uuid".to_string(),
             properties: vec![

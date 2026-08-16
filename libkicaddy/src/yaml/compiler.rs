@@ -136,6 +136,28 @@ impl Compiler {
             connections_made += 1;
         }
 
+        // Create no-connect markers after components are placed
+        for connection in &all_connections {
+            for pin_ref in &connection.no_connect {
+                let parts: Vec<&str> = pin_ref.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+
+                let reference = parts[0];
+                let pin = parts[1];
+                let symbol = schematic
+                    .find_symbol_by_reference(reference)
+                    .ok_or_else(|| YamlError::Other(format!("Component '{}' not found while placing no-connect marker", reference)))?;
+
+                let (position, _) = schematic
+                    .get_pin_position(symbol, pin)
+                    .ok_or_else(|| YamlError::Other(format!("Pin '{}' not found on '{}' while placing no-connect marker", pin, reference)))?;
+
+                schematic.add_no_connect(position);
+            }
+        }
+
         Ok(CompileOutput {
             schematic,
             components_placed,
@@ -397,27 +419,25 @@ impl Compiler {
         let actual_ref =
             schematic.add_symbol(&symbol, &lib_id, position, Some(reference), component.value.as_deref());
 
-        // Apply mirror setting if specified
-        if let Some(ref mirror_str) = component.mirror {
-            let mirror = match mirror_str.to_lowercase().as_str() {
-                "x" => Some(Mirror::X),
-                "y" => Some(Mirror::Y),
-                _ => None,
-            };
+        // Apply component flags and attributes after placement.
+        if let Some(sym) = schematic
+            .symbols
+            .iter_mut()
+            .find(|s| s.properties.iter().any(|p| p.name == "Reference" && p.value == actual_ref))
+        {
+            sym.exclude_from_sim = component.exclude_from_sim;
+            sym.in_bom = component.in_bom;
+            sym.on_board = component.on_board;
+            sym.dnp = component.dnp;
+            sym.power = component.power;
 
-            if let Some(m) = mirror {
-                // Find the symbol we just added and set its mirror
-                if let Some(sym) = schematic
-                    .symbols
-                    .iter_mut()
-                    .find(|s| {
-                        s.properties
-                            .iter()
-                            .any(|p| p.name == "Reference" && p.value == actual_ref)
-                    })
-                {
-                    sym.mirror = Some(m);
-                }
+            if let Some(ref mirror_str) = component.mirror {
+                let mirror = match mirror_str.to_lowercase().as_str() {
+                    "x" => Some(Mirror::X),
+                    "y" => Some(Mirror::Y),
+                    _ => None,
+                };
+                sym.mirror = mirror;
             }
         }
 
@@ -742,6 +762,92 @@ components:
         let yaml_sch = YamlSchematic::from_str(yaml).unwrap();
         let validation = validate(&yaml_sch);
         assert!(!validation.is_valid());
+    }
+
+    #[test]
+    fn test_compile_no_connect_pin() {
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+
+connections:
+  - no_connect: [R1:2]
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        assert_eq!(output.schematic.no_connects.len(), 1);
+
+        let symbol = output
+            .schematic
+            .find_symbol_by_reference("R1")
+            .expect("R1 should be placed");
+        let (expected, _) = output
+            .schematic
+            .get_pin_position(symbol, "2")
+            .expect("R1 pin 2 should exist");
+
+        let nc = &output.schematic.no_connects[0];
+        assert!((nc.position.x - expected.x).abs() < 0.01);
+        assert!((nc.position.y - expected.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compile_component_flags() {
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+    dnp: true
+    exclude_from_sim: true
+    in_bom: false
+    on_board: false
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        let symbol = output
+            .schematic
+            .symbols
+            .iter()
+            .find(|s| s.properties.iter().any(|p| p.name == "Reference" && p.value == "R1"))
+            .unwrap();
+
+        assert!(symbol.dnp);
+        assert!(symbol.exclude_from_sim);
+        assert!(!symbol.in_bom);
+        assert!(!symbol.on_board);
+    }
+
+    #[test]
+    fn test_compile_component_power_flag() {
+        let yaml = r#"
+components:
+  P1:
+    symbol: power:GND
+    position: [100, 50]
+    value: GND
+    power: true
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        let symbol = output
+            .schematic
+            .symbols
+            .iter()
+            .find(|s| s.properties.iter().any(|p| p.name == "Reference" && p.value == "P1"))
+            .unwrap();
+
+        assert!(symbol.power);
     }
 
     #[test]

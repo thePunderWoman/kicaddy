@@ -99,6 +99,26 @@ pub struct ComponentDef {
     #[serde(default = "default_unit")]
     pub unit: u32,
 
+    /// Exclude this component from simulation output.
+    #[serde(default)]
+    pub exclude_from_sim: bool,
+
+    /// Include this component in the BOM.
+    #[serde(default = "default_bool_true")]
+    pub in_bom: bool,
+
+    /// Include this component on the PCB.
+    #[serde(default = "default_bool_true")]
+    pub on_board: bool,
+
+    /// Mark this component as Do Not Populate.
+    #[serde(default)]
+    pub dnp: bool,
+
+    /// Mark this component as a power symbol (e.g. GND / VCC / +3V3).
+    #[serde(default)]
+    pub power: bool,
+
     /// Additional properties (Footprint, etc.)
     #[serde(default)]
     pub properties: HashMap<String, String>,
@@ -106,6 +126,10 @@ pub struct ComponentDef {
 
 fn default_unit() -> u32 {
     1
+}
+
+fn default_bool_true() -> bool {
+    true
 }
 
 /// Position that can be specified as [x, y] array or {x, y} object
@@ -149,8 +173,13 @@ pub struct Connection {
     #[serde(default)]
     pub net: Option<String>,
 
-    /// Pin references in "REF:pin" format (e.g., ["R1:1", "C1:2", "U1:10"])
+    /// Pin references in "REF:pin" format that should be connected together.
+    #[serde(default)]
     pub pins: Vec<String>,
+
+    /// Pin references in "REF:pin" format that should be marked as no-connect.
+    #[serde(default)]
+    pub no_connect: Vec<String>,
 
     /// Force global label (otherwise auto-detected from net name)
     #[serde(default)]
