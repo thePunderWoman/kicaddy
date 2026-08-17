@@ -148,6 +148,135 @@ fn hierarchy_wiring_errors(report: &serde_json::Value) -> Vec<(String, String, V
         .collect()
 }
 
+/// Grid-snap a value to the same 1.27mm grid the compiler snaps to, so generated sheet/pin
+/// geometry lands exactly on-edge (see place_sheet's border validation).
+fn snap(v: f64) -> f64 {
+    (v / 1.27).round() * 1.27
+}
+
+/// Build a yaml schematic with `n` independently-declared nets crossing between two sheets
+/// (`SideA`'s bottom edge to `SideB`'s top edge), evenly spaced along a shared-width edge. If
+/// `duplicate_pins_net` is `Some(i)`, that net gets 2 extra same-sheet pins on SideB's side
+/// (mimicking a component pin plus a local pull-up/decoupling part sharing the net locally) —
+/// this is the shape of the real-world I2C_SCL/I2C_SDA/WL_ON case.
+fn generate_dense_edge_yaml(n: usize, duplicate_pins_net: Option<usize>) -> String {
+    let sheet_w = snap(700.0);
+    let sheet_h = snap(150.0);
+    let margin = 20.0;
+    let span = sheet_w - 2.0 * margin;
+    let gap = snap(100.0);
+
+    let x_at = |i: usize| snap(margin + span * (i as f64 + 0.5) / n as f64);
+
+    let mut yaml = String::from("meta:\n  paper: A4\n\ncomponents:\n");
+    for i in 0..n {
+        let x = x_at(i);
+        yaml += &format!(
+            "  UA{i}:\n    symbol: Device:R\n    position: [{x}, 50]\n    sheet: SideA\n"
+        );
+        yaml += &format!(
+            "  UB{i}:\n    symbol: Device:R\n    position: [{x}, 50]\n    sheet: SideB\n"
+        );
+    }
+    if let Some(dup_i) = duplicate_pins_net {
+        assert!(dup_i < n);
+        let x = x_at(dup_i);
+        yaml += &format!(
+            "  UB{dup_i}_pullup:\n    symbol: Device:R\n    position: [{x}, 90]\n    sheet: SideB\n"
+        );
+        yaml += &format!(
+            "  UB{dup_i}_decouple:\n    symbol: Device:R\n    position: [{x}, 120]\n    sheet: SideB\n"
+        );
+    }
+
+    yaml += &format!(
+        "\nsheets:\n  SideA:\n    path: side_a_dense\n    position: [0, 0]\n    size: [{sheet_w}, {sheet_h}]\n    pins:\n"
+    );
+    for i in 0..n {
+        yaml += &format!(
+            "      - name: NET{i}\n        shape: bidirectional\n        position: [{}, {sheet_h}]\n",
+            x_at(i)
+        );
+    }
+    let side_b_x = sheet_w + gap;
+    yaml += &format!(
+        "  SideB:\n    path: side_b_dense\n    position: [{side_b_x}, 0]\n    size: [{sheet_w}, {sheet_h}]\n    pins:\n"
+    );
+    for i in 0..n {
+        yaml += &format!(
+            "      - name: NET{i}\n        shape: bidirectional\n        position: [{}, 0]\n",
+            snap(side_b_x + x_at(i))
+        );
+    }
+
+    yaml += "\nconnections:\n";
+    for i in 0..n {
+        yaml += &format!("  - net: NET{i}\n    pins: [UA{i}:1, UB{i}:1");
+        if duplicate_pins_net == Some(i) {
+            yaml += &format!(", UB{i}_pullup:1, UB{i}_decouple:1");
+        }
+        yaml += "]\n";
+    }
+
+    yaml
+}
+
+#[test]
+fn test_erc_dense_pin_packing_on_one_edge() {
+    let kicad_cli = require_kicad_cli!();
+
+    // 19 independent nets, all pins evenly spaced along the same 700-unit sheet edge — matches
+    // the shape that first surfaced this bug (MCU_Core's 19-pin bottom edge in the real
+    // SnipsControllers migration). Root cause: Orthogonal routing's L-shaped hub-and-spoke wire
+    // ran its horizontal leg along the shared edge for every net, so unrelated nets' wires
+    // overlapped collinearly over a wide span; KiCAD's ERC then non-deterministically
+    // misattributed connectivity for a fraction of them. Fixed by switching to Direct routing.
+    let yaml = generate_dense_edge_yaml(19, None);
+
+    let dir = std::env::temp_dir().join(format!("kicaddy_erc_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root_path = compile_to_dir(&yaml, &dir, "root");
+
+    let report = run_erc(&kicad_cli, &root_path);
+    let bad = hierarchy_wiring_errors(&report);
+    assert!(
+        bad.is_empty(),
+        "19 nets densely packed on one sheet edge should all be ERC-clean, got: {:#?}",
+        bad
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_erc_same_sheet_duplicate_pins_within_dense_packing() {
+    let kicad_cli = require_kicad_cli!();
+
+    // A net with 2+ participating pins on the same (non-primary) sheet — e.g. an IC pin plus a
+    // local pull-up resistor pin — creates a separate hierarchical_label per local pin rather
+    // than joining them first. That pattern alone is electrically harmless (KiCAD treats
+    // same-named hierarchical labels on one screen as joined, like ordinary labels); it was
+    // originally misdiagnosed as a distinct bug because it was tested only inside dense edge
+    // packing, where the real cause (see test_erc_dense_pin_packing_on_one_edge) was already
+    // failing a fraction of *every* net on that edge, duplicate-pin or not. This test mixes both
+    // shapes into one repro to guard against that conflation recurring.
+    let yaml = generate_dense_edge_yaml(12, Some(5));
+
+    let dir = std::env::temp_dir().join(format!("kicaddy_erc_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root_path = compile_to_dir(&yaml, &dir, "root");
+
+    let report = run_erc(&kicad_cli, &root_path);
+    let bad = hierarchy_wiring_errors(&report);
+    assert!(
+        bad.is_empty(),
+        "a net with duplicate same-sheet pins mixed into dense edge packing should be ERC-clean, got: {:#?}",
+        bad
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn test_erc_declared_sheet_pins_cross_sheet_connection() {
     let kicad_cli = require_kicad_cli!();

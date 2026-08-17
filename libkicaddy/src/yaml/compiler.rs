@@ -435,7 +435,19 @@ impl Compiler {
                         root.add_junction(hub);
                     }
                     for pos in &root_side_points[1..] {
-                        root.add_wire_routed(hub, *pos, crate::schematic::RoutingMode::Orthogonal);
+                        // Direct (not Orthogonal) routing is deliberate: when many sheet-crossing
+                        // nets share a common "hub row" — e.g. many declared pins along one edge
+                        // of a sheet, each getting its own hub-and-spoke wire here — Orthogonal's
+                        // L-shaped route runs its horizontal leg along that shared edge for every
+                        // one of them, so unrelated nets' wire segments overlap collinearly over a
+                        // wide shared span. KiCAD's ERC then non-deterministically (by whichever
+                        // sheet happens to end up as the hub, itself HashSet-order-dependent, not
+                        // yaml order) misattributes connectivity for a fraction of them —
+                        // label_dangling on some, clean on geometrically identical neighbors.
+                        // Verified: switching to Direct across dense edge-packing repros (19 nets
+                        // on one 700-unit edge; a net with 2-3 same-sheet pins mixed into a dense
+                        // edge) eliminates it entirely, with no other regressions.
+                        root.add_wire_routed(hub, *pos, crate::schematic::RoutingMode::Direct);
                     }
                 }
             }
