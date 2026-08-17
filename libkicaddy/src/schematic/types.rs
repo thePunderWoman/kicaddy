@@ -306,12 +306,24 @@ impl Schematic {
             })
             .collect();
 
-        // Create project instance with reference
-        // The path is "/{schematic_uuid}" for the root sheet
+        // Create project instance with reference.
+        // For the true root schematic the path is "/{schematic_uuid}". For a child sheet's
+        // schematic, `self.uuid` is that *file's own* uuid, not the root's — the correct path
+        // is the full root-to-this-sheet uuid chain, which compile() already computed and
+        // stored in `sheet_instances` before any symbols are placed into a child.
+        // `Schematic::new()` seeds every schematic (root included) with a placeholder
+        // `sheet_instances` entry of "/" — that's only overwritten for genuine child sheets, so
+        // it's what distinguishes "still the true root" from "a child whose real chain is set".
+        let instance_path = self
+            .sheet_instances
+            .first()
+            .filter(|inst| inst.path != "/")
+            .map(|inst| inst.path.clone())
+            .unwrap_or_else(|| format!("/{}", self.uuid));
         let project_instance = ProjectInstance {
             project_name: String::new(), // Empty project name for standalone schematics
             paths: vec![PathInstance {
-                path: format!("/{}", self.uuid),
+                path: instance_path,
                 reference: ref_value.clone(),
                 unit: 1,
             }],

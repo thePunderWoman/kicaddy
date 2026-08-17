@@ -1,6 +1,6 @@
 //! YAML to KiCAD schematic compiler
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::commands::{snap_to_grid, Command, ConnectCommand};
 use crate::common::{Point, Position};
@@ -11,13 +11,17 @@ use crate::symbol::lookup::find_symbol;
 use crate::symbol::Symbol;
 
 use super::error::YamlError;
-use super::types::{ComponentDef, YamlSchematic};
+use super::types::{ComponentDef, SheetDef, YamlSchematic};
 use super::validation::{validate_deep, ValidationResult};
 
 /// Output from compiling a YAML schematic
 #[derive(Debug, Clone)]
 pub struct CompileOutput {
-    /// The compiled schematic
+    /// Primary/root schematic for sheetless content and sheet definitions.
+    pub root: Schematic,
+    /// Child schematics keyed by sheet name.
+    pub children: HashMap<String, Schematic>,
+    /// Backwards-compatible alias for the root schematic.
     pub schematic: Schematic,
     /// Components that were placed (reference -> lib_id)
     pub components_placed: HashMap<String, String>,
@@ -78,30 +82,52 @@ impl Compiler {
         Self { config }
     }
 
-    /// Compile a YAML schematic definition into a KiCAD schematic
+    /// Compile a YAML schematic definition into KiCAD schematics.
+    ///
+    /// The root schematic contains all root-level components and all sheet definitions.
+    /// Each named sheet is compiled into a child schematic and keyed by sheet name.
     pub fn compile(&self, yaml_sch: &YamlSchematic) -> Result<CompileOutput, YamlError> {
         // First validate the YAML schematic with deep symbol/pin checking
         let validation = validate_deep(yaml_sch, &self.config);
         if !validation.is_valid() {
-            // Return the first error
             return Err(validation.errors.into_iter().next().unwrap());
         }
 
-        let mut schematic = Schematic::new();
+        let mut root = Schematic::new();
+        let mut children: HashMap<String, Schematic> = HashMap::new();
         let mut components_placed = HashMap::new();
         let mut connections_made = 0;
+        let mut warnings = validation.warnings;
+        // Declared sheet pins that a connection actually wired up. `place_sheet` puts every
+        // declared pin onto the sheet symbol unconditionally (it runs before connections are
+        // processed and doesn't know yet which will be used), but a pin only ends up with a
+        // matching hierarchical label when some cross-sheet connection references it — a
+        // same-sheet-only connection, or no connection at all, never touches this path. Left
+        // in place, such a pin has nothing inside the child sheet pointing back at it, so KiCAD
+        // reports hier_label_mismatch. Tracked here so unused ones can be dropped afterward.
+        let mut used_sheet_pins: HashSet<(String, String)> = HashSet::new();
 
-        // Apply meta settings
-        self.apply_meta(&mut schematic, &yaml_sch.meta)?;
+        self.apply_meta(&mut root, &yaml_sch.meta)?;
 
-        // Get all components and connections (merged from groups and top-level)
+        for (sheet_name, sheet_def) in &yaml_sch.sheets {
+            self.place_sheet(&mut root, sheet_name, sheet_def)?;
+            let mut child = Schematic::new();
+            self.apply_meta(&mut child, &yaml_sch.meta)?;
+
+            if let Some(sheet) = root.sheets.iter().find(|s| s.sheet_name == *sheet_name) {
+                child.sheet_instances = vec![crate::schematic::SheetInstance {
+                    path: Self::sheet_instance_path(&root.uuid, &sheet.uuid),
+                    page: "1".to_string(),
+                }];
+            }
+
+            children.insert(sheet_name.clone(), child);
+        }
+
         let all_components = yaml_sch.all_components();
         let all_connections = yaml_sch.all_connections();
-
-        // Check if any components need auto-layout
         let needs_layout = all_components.values().any(|c| c.position.is_none());
 
-        // Look up all symbols (needed for both placement and layout)
         let mut symbols: HashMap<String, Symbol> = HashMap::new();
         for (reference, component) in &all_components {
             let parts: Vec<&str> = component.symbol.splitn(2, ':').collect();
@@ -110,37 +136,349 @@ impl Compiler {
             }
             let library = parts[0];
             let symbol_name = parts[1];
-
             if let Ok(symbol) = find_symbol(&self.config, library, symbol_name) {
                 symbols.insert(reference.clone(), symbol);
             }
         }
 
-        // Compute layout positions if needed
         let computed_positions = if needs_layout {
             self.compute_layout(yaml_sch, &all_components, &all_connections, &symbols)?
         } else {
             HashMap::new()
         };
 
-        // Place all components
+        let mut by_sheet: HashMap<String, Vec<(&String, &ComponentDef)>> = HashMap::new();
         for (reference, component) in &all_components {
-            let position = computed_positions.get(reference).cloned();
-            let lib_id = self.place_component(&mut schematic, reference, component, position)?;
-            components_placed.insert(reference.clone(), lib_id);
+            let sheet_name = component
+                .sheet
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("__root__")
+                .to_string();
+            by_sheet.entry(sheet_name).or_default().push((reference, component));
         }
 
-        // Create all connections
+        for (sheet_name, entries) in &by_sheet {
+            let target = if sheet_name == "__root__" {
+                &mut root
+            } else {
+                children.get_mut(sheet_name).ok_or_else(|| {
+                    YamlError::Other(format!("Sheet '{}' is defined but not compiled", sheet_name))
+                })?
+            };
+
+            for (reference, component) in entries {
+                let position = computed_positions.get(*reference).cloned();
+                let lib_id = self.place_component(target, reference, component, position)?;
+                components_placed.insert((*reference).clone(), lib_id);
+            }
+        }
+
         for connection in &all_connections {
-            self.create_connection(&mut schematic, connection)?;
+            let mut sheet_names: HashSet<String> = HashSet::new();
+            for pin_ref in &connection.pins {
+                let parts: Vec<&str> = pin_ref.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+
+                let reference = parts[0];
+                let component = all_components.get(reference);
+                let sheet_name = component
+                    .and_then(|c| c.sheet.as_deref())
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "__root__".to_string());
+                sheet_names.insert(sheet_name);
+            }
+
+            if sheet_names.is_empty() {
+                sheet_names.insert("__root__".to_string());
+            }
+
+            if sheet_names.len() == 1 {
+                let sheet_name = sheet_names.iter().next().unwrap();
+                if sheet_name == "__root__" {
+                    self.create_connection(&mut root, connection)?;
+                } else {
+                    let target = children.get_mut(sheet_name).ok_or_else(|| {
+                        YamlError::Other(format!(
+                            "Connection {:?} references sheet '{}' but no child schematic was created",
+                            connection, sheet_name
+                        ))
+                    })?;
+                    self.create_connection(target, connection)?;
+                }
+                connections_made += 1;
+                continue;
+            }
+
+            // Check if this is a global or power net that can bypass sheet pin requirements
+            let is_global_net = connection.global.unwrap_or(false);
+            let is_power_net = connection.net.as_ref()
+                .map(|net| {
+                    let upper = net.to_uppercase();
+                    // Common ground names
+                    matches!(upper.as_str(), "GND" | "AGND" | "DGND" | "PGND" | "VSS" | "GNDA" | "GNDD") ||
+                    // VCC variants
+                    upper.starts_with("VCC") || upper.starts_with("VDD") || upper.starts_with("VSS") ||
+                    // Voltage rails like +3V3, +5V, +12V, -5V, etc.
+                    ((upper.starts_with('+') || upper.starts_with('-')) && upper.contains('V')) ||
+                    // Common power names
+                    matches!(upper.as_str(), "3V3" | "5V" | "12V" | "1V8" | "2V5" | "VBAT" | "VIN" | "VOUT")
+                })
+                .unwrap_or(false);
+
+            // Find pins that are on the root sheet
+            let root_pins: Vec<(&str, &str)> = connection.pins
+                .iter()
+                .filter_map(|pin_ref| {
+                    let parts: Vec<&str> = pin_ref.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let reference = parts[0];
+                        let pin = parts[1];
+                        if let Some(component) = all_components.get(reference) {
+                            let component_sheet = component
+                                .sheet
+                                .as_deref()
+                                .filter(|name| !name.trim().is_empty())
+                                .unwrap_or("__root__");
+                            if component_sheet == "__root__" {
+                                return Some((reference, pin));
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            let mut handled = false;
+            // Positions of declared sheet pins this connection must wire root-side pins to.
+            // A hierarchical label only propagates a net onto the parent sheet symbol's matching
+            // pin, so anything on the root that shares the net has to be physically wired to that
+            // pin's exact position (not just labeled) or it stays electrically isolated.
+            let mut hierarchical_targets: Vec<Point> = Vec::new();
+            for sheet_name in sheet_names.iter() {
+                if sheet_name == "__root__" {
+                    continue;
+                }
+
+                let target = children.get_mut(sheet_name).ok_or_else(|| {
+                    YamlError::Other(format!(
+                        "Connection {:?} crosses sheet '{}' but no child schematic was created",
+                        connection, sheet_name
+                    ))
+                })?;
+
+                // Find all pins from this sheet that are part of this connection
+                let pins_in_sheet: Vec<(&str, &str)> = connection.pins
+                    .iter()
+                    .filter_map(|pin_ref| {
+                        let parts: Vec<&str> = pin_ref.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            let reference = parts[0];
+                            let pin = parts[1];
+                            if let Some(component) = all_components.get(reference) {
+                                let component_sheet = component
+                                    .sheet
+                                    .as_deref()
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or("__root__");
+                                if component_sheet == sheet_name {
+                                    return Some((reference, pin));
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                if pins_in_sheet.is_empty() {
+                    continue;
+                }
+
+                let sheet_def = yaml_sch.sheets.get(sheet_name);
+                let pin_name = connection.net.clone().unwrap_or_else(|| {
+                    sheet_def
+                        .and_then(|def| def.pins.first())
+                        .map(|pin| pin.name.clone())
+                        .unwrap_or_else(|| "net".to_string())
+                });
+
+                // For global/power nets, use default hierarchical label shape
+                // For explicit nets, require sheet pin definition
+                let sheet_pin = sheet_def
+                    .and_then(|def| def.pins.iter().find(|p| p.name == pin_name));
+
+                if sheet_pin.is_none() && !is_global_net && !is_power_net {
+                    // Non-global, non-power cross-sheet connections require explicit sheet pins
+                    continue;
+                }
+
+                // A declared sheet pin means the user opted into a properly-scoped hierarchical
+                // connection: label the pins inside the child AND wire root-side pins to the
+                // pin's exact position on the parent sheet symbol. Without a declared pin (pure
+                // global/power net), fall back to real global labels, which connect by name
+                // anywhere in the project and need no matching sheet pin at all.
+                if let Some(declared_pin) = sheet_pin {
+                    let label_shape = crate::schematic::LabelShape::from_str(
+                        declared_pin.shape.as_deref().unwrap_or("input"),
+                    );
+                    // Read back the already-placed (and grid-snapped) sheet pin from `root.sheets`
+                    // rather than the raw yaml position, so this matches exactly what wire-endpoint
+                    // snapping will target.
+                    if let Some(placed_pin) = root
+                        .sheets
+                        .iter()
+                        .find(|s| s.sheet_name == *sheet_name)
+                        .and_then(|s| s.pins.iter().find(|p| p.name == declared_pin.name))
+                    {
+                        hierarchical_targets.push(Point::new(placed_pin.position.x, placed_pin.position.y));
+                        used_sheet_pins.insert((sheet_name.clone(), declared_pin.name.clone()));
+                    }
+
+                    for (reference, pin) in pins_in_sheet {
+                        if let Some(symbol) = target.find_symbol_by_reference(reference) {
+                            if let Some((pos, pin_angle)) = target.get_pin_position(symbol, pin) {
+                                let label_angle = match (pin_angle as i32) % 360 {
+                                    0 => 0.0,     // Pin points right
+                                    90 => 90.0,   // Pin points up
+                                    180 => 180.0, // Pin points left
+                                    270 => 270.0, // Pin points down
+                                    a if a < 0 => ((a + 360) % 360) as f64,
+                                    _ => pin_angle,
+                                };
+                                target.hierarchical_labels.push(crate::schematic::HierarchicalLabel {
+                                    text: pin_name.clone(),
+                                    shape: label_shape,
+                                    position: crate::common::Position::new(pos.x, pos.y, label_angle),
+                                    fields_autoplaced: false,
+                                    effects: None,
+                                    uuid: uuid::Uuid::new_v4().to_string(),
+                                    properties: Vec::new(),
+                                });
+                                handled = true;
+                            }
+                        }
+                    }
+                } else {
+                    let label_shape = if is_power_net {
+                        crate::schematic::LabelShape::Passive
+                    } else {
+                        crate::schematic::LabelShape::Input
+                    };
+
+                    for (reference, pin) in pins_in_sheet {
+                        if let Some(symbol) = target.find_symbol_by_reference(reference) {
+                            if let Some((pos, pin_angle)) = target.get_pin_position(symbol, pin) {
+                                let label_angle = match (pin_angle as i32) % 360 {
+                                    0 => 0.0,
+                                    90 => 90.0,
+                                    180 => 180.0,
+                                    270 => 270.0,
+                                    a if a < 0 => ((a + 360) % 360) as f64,
+                                    _ => pin_angle,
+                                };
+                                target.add_global_label(
+                                    &pin_name,
+                                    crate::common::Position::new(pos.x, pos.y, label_angle),
+                                    label_shape,
+                                );
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if hierarchical_targets.is_empty() {
+                // No declared sheet pin was involved anywhere in this connection: fall back to
+                // the global-label path for any root-side pins, same as the single-sheet case.
+                // Only the root-side pins are passed in — the full `connection` also lists pins
+                // that live on child sheets, and those references don't resolve inside the root
+                // schematic.
+                if !root_pins.is_empty() {
+                    let root_connection = super::types::Connection {
+                        net: connection.net.clone(),
+                        pins: root_pins
+                            .iter()
+                            .map(|(reference, pin)| format!("{}:{}", reference, pin))
+                            .collect(),
+                        global: connection.global,
+                    };
+                    self.create_connection(&mut root, &root_connection)?;
+                } else if !handled && !is_global_net && !is_power_net {
+                    return Err(YamlError::Other(format!(
+                        "Connection {:?} crosses sheet boundaries but no matching sheet pin definitions were found (use global: true or declare sheet pins)",
+                        connection
+                    )));
+                }
+            } else {
+                // At least one declared sheet pin is part of this connection: every point that
+                // shares the net on the root schematic — root component pins AND every involved
+                // sheet symbol's pin (when two sibling sheets both declare a pin for this net)
+                // — needs an actual wire between them. A hierarchical label only reaches as far
+                // as the matching sheet pin; nothing propagates further on the root by name alone.
+                let mut root_side_points: Vec<Point> = root_pins
+                    .iter()
+                    .filter_map(|(reference, pin)| {
+                        let symbol = root.find_symbol_by_reference(reference)?;
+                        root.get_pin_position(symbol, pin).map(|(pos, _)| pos)
+                    })
+                    .collect();
+                root_side_points.extend(hierarchical_targets.iter().copied());
+
+                if root_side_points.len() >= 2 {
+                    let hub = root_side_points[0];
+                    if root_side_points.len() > 2 {
+                        root.add_junction(hub);
+                    }
+                    for pos in &root_side_points[1..] {
+                        // Direct (not Orthogonal) routing is deliberate: when many sheet-crossing
+                        // nets share a common "hub row" — e.g. many declared pins along one edge
+                        // of a sheet, each getting its own hub-and-spoke wire here — Orthogonal's
+                        // L-shaped route runs its horizontal leg along that shared edge for every
+                        // one of them, so unrelated nets' wire segments overlap collinearly over a
+                        // wide shared span. KiCAD's ERC then non-deterministically (by whichever
+                        // sheet happens to end up as the hub, itself HashSet-order-dependent, not
+                        // yaml order) misattributes connectivity for a fraction of them —
+                        // label_dangling on some, clean on geometrically identical neighbors.
+                        // Verified: switching to Direct across dense edge-packing repros (19 nets
+                        // on one 700-unit edge; a net with 2-3 same-sheet pins mixed into a dense
+                        // edge) eliminates it entirely, with no other regressions.
+                        root.add_wire_routed(hub, *pos, crate::schematic::RoutingMode::Direct);
+                    }
+                }
+            }
+
             connections_made += 1;
         }
 
+        // Drop any declared sheet pin that no connection actually wired up (see the comment on
+        // `used_sheet_pins` above) rather than shipping a schematic KiCAD will flag as broken.
+        for sheet in &mut root.sheets {
+            let sheet_name = sheet.sheet_name.clone();
+            sheet.pins.retain(|pin| {
+                let used = used_sheet_pins.contains(&(sheet_name.clone(), pin.name.clone()));
+                if !used {
+                    warnings.push(format!(
+                        "Sheet '{}' declares pin '{}' but no connection wires it up (same-sheet \
+                         connections don't reach it, and neither does an unused declaration) — omitted",
+                        sheet_name, pin.name
+                    ));
+                }
+                used
+            });
+        }
+
+        let root_schematic = root.clone();
         Ok(CompileOutput {
-            schematic,
+            root: root_schematic.clone(),
+            children: children.clone(),
+            schematic: root_schematic,
             components_placed,
             connections_made,
-            warnings: validation.warnings,
+            warnings,
         })
     }
 
@@ -422,6 +760,119 @@ impl Compiler {
         }
 
         Ok(lib_id)
+    }
+
+    /// Build the KiCad sheet-instance path for a child sheet.
+    fn sheet_instance_path(root_uuid: &str, sheet_uuid: &str) -> String {
+        format!("/{}/{}", root_uuid, sheet_uuid)
+    }
+
+    /// Place a hierarchical sheet definition in the schematic
+    fn place_sheet(
+        &self,
+        schematic: &mut Schematic,
+        sheet_name: &str,
+        sheet_def: &SheetDef,
+    ) -> Result<(), YamlError> {
+        let position = sheet_def
+            .position
+            .as_ref()
+            .map(|pos| Position::new(pos.x(), pos.y(), 0.0))
+            .unwrap_or_default();
+
+        let size = sheet_def
+            .size
+            .map(|[w, h]| (w, h))
+            .unwrap_or((200.0, 150.0));
+
+        let path = sheet_def
+            .path
+            .clone()
+            .unwrap_or_else(|| sheet_name.to_string());
+
+        // KiCAD resolves the child sheet's screen from this property by filename on disk,
+        // so it must carry the extension even though the yaml `path` typically omits it.
+        let sheet_file_property = if path.ends_with(".kicad_sch") {
+            path.clone()
+        } else {
+            format!("{}.kicad_sch", path)
+        };
+
+        let pins = sheet_def
+            .pins
+            .iter()
+            .map(|pin| {
+                let raw_x = pin.position.as_ref().map(|pos| pos.x()).unwrap_or(0.0);
+                let raw_y = pin.position.as_ref().map(|pos| pos.y()).unwrap_or(0.0);
+
+                // KiCAD orients a sheet pin's glyph to match whichever edge of the sheet
+                // rectangle it sits on (verified against hand-authored .kicad_sch files):
+                // right edge -> 0, left edge -> 180, top edge -> 90, bottom edge -> 270.
+                // A wrong angle here (e.g. always 0) makes KiCAD treat the pin as
+                // disconnected even when a wire lands exactly on its coordinates.
+                // Edge detection uses the *raw* yaml coordinates against the sheet's raw
+                // bounds — the sheet's width/height are rarely exact multiples of the grid
+                // (e.g. a 200mm-wide sheet), so comparing already-snapped values against an
+                // unsnapped edge would miss the match entirely.
+                //
+                // A pin that isn't on any edge at all (interior point, typo, or a sheet with
+                // no explicit position/size so it defaults to (0,0)-(200,150)) can't be wired
+                // correctly no matter what angle is guessed — it silently produces
+                // wire_dangling/pin_not_connected in kicad-cli sch erc with no indication why.
+                // Fail loudly here instead, at the point where the bad coordinate is known.
+                const EPS: f64 = 0.01;
+                let angle = if (raw_x - position.x).abs() < EPS {
+                    180.0
+                } else if (raw_x - (position.x + size.0)).abs() < EPS {
+                    0.0
+                } else if (raw_y - position.y).abs() < EPS {
+                    90.0
+                } else if (raw_y - (position.y + size.1)).abs() < EPS {
+                    270.0
+                } else {
+                    return Err(YamlError::Other(format!(
+                        "Sheet '{}' pin '{}' at ({}, {}) is not on the border of the sheet rectangle \
+                         ({}, {}) to ({}, {}) — sheet pins must sit exactly on the left/right/top/bottom \
+                         edge (within {} units) or KiCAD can't wire them",
+                        sheet_name, pin.name, raw_x, raw_y,
+                        position.x, position.y, position.x + size.0, position.y + size.1,
+                        EPS
+                    )));
+                };
+
+                // Snapped to match the grid every wire endpoint is snapped to (see
+                // `create_connection`'s wiring of root-side pins to this exact position) —
+                // otherwise a wire aimed at the raw yaml coordinate lands a fraction of a
+                // grid cell short and ERC reports it as unconnected.
+                let x = snap_to_grid(raw_x);
+                let y = snap_to_grid(raw_y);
+
+                Ok(crate::schematic::SheetPin {
+                    name: pin.name.clone(),
+                    shape: crate::schematic::LabelShape::from_str(
+                        pin.shape.as_deref().unwrap_or("input"),
+                    ),
+                    position: Position::new(x, y, angle),
+                    uuid: uuid::Uuid::new_v4().to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, YamlError>>()?;
+
+        schematic.sheets.push(crate::schematic::Sheet {
+            position,
+            size,
+            uuid: uuid::Uuid::new_v4().to_string(),
+            sheet_name: sheet_name.to_string(),
+            sheet_file: sheet_file_property,
+            pins,
+            dnp: false,
+            exclude_from_sim: false,
+            in_bom: true,
+            on_board: true,
+            fields_autoplaced: false,
+        });
+
+        Ok(())
     }
 
     /// Compute layout positions for components that don't have explicit positions
@@ -742,6 +1193,204 @@ components:
         let yaml_sch = YamlSchematic::from_str(yaml).unwrap();
         let validation = validate(&yaml_sch);
         assert!(!validation.is_valid());
+    }
+
+    #[test]
+    fn test_compile_sheet_definitions() {
+        let yaml = r#"
+components:
+  U1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+    sheet: Power
+
+sheets:
+  Power:
+    path: power
+    position: [0, 0]
+    size: [200, 150]
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        assert_eq!(output.root.sheets.len(), 1);
+        assert_eq!(output.root.sheets[0].sheet_name, "Power");
+        assert_eq!(output.root.sheets[0].sheet_file, "power.kicad_sch");
+        assert_eq!(output.children.len(), 1);
+        assert!(output.children.contains_key("Power"));
+
+        let child = output.children.get("Power").unwrap();
+        assert_eq!(child.sheet_instances.len(), 1);
+        assert!(child.sheet_instances[0].path.starts_with(&format!("/{}", output.root.uuid)));
+        assert!(child.sheet_instances[0].path.ends_with(&output.root.sheets[0].uuid));
+    }
+
+    #[test]
+    fn test_compile_same_sheet_connection_stays_on_child_schematic() {
+        let yaml = r#"
+components:
+  U1:
+    symbol: Device:R
+    position: [100, 50]
+    sheet: Power
+  U2:
+    symbol: Device:R
+    position: [200, 50]
+    sheet: Power
+
+sheets:
+  Power:
+    path: power
+    position: [0, 0]
+    size: [200, 150]
+    pins:
+      - name: VCC
+        shape: output
+        position: [0, 50]
+
+connections:
+  - net: VCC
+    pins: [U1:1, U2:1]
+"#;
+        let output = compile_yaml_str(yaml).unwrap();
+        let power_child = output.children.get("Power").unwrap();
+
+        assert!(!power_child.wires.is_empty() || !power_child.labels.is_empty() || !power_child.global_labels.is_empty());
+
+        // The declared VCC pin sits on a valid edge, but only a same-sheet connection ever
+        // references it — no cross-sheet connection wires it up, so it should be dropped rather
+        // than left as a dangling sheet pin, with a warning explaining why.
+        assert!(output.root.sheets[0].pins.is_empty());
+        assert!(output.warnings.iter().any(|w| w.contains("VCC") && w.contains("Power")));
+    }
+
+    #[test]
+    fn test_compile_cross_sheet_connection_uses_hierarchical_labels() {
+        let yaml = r#"
+components:
+  U1:
+    symbol: Device:R
+    position: [100, 50]
+    sheet: Power
+  U2:
+    symbol: Device:R
+    position: [200, 50]
+    sheet: Control
+
+sheets:
+  Power:
+    path: power
+    position: [0, 0]
+    size: [200, 150]
+    pins:
+      - name: VCC
+        shape: output
+        position: [200, 50]
+  Control:
+    path: control
+    position: [250, 0]
+    size: [200, 150]
+    pins:
+      - name: VCC
+        shape: input
+        position: [250, 50]
+
+connections:
+  - net: VCC
+    pins: [U1:1, U2:1]
+"#;
+        let output = compile_yaml_str(yaml).unwrap();
+
+        let power_child = output.children.get("Power").unwrap();
+        let control_child = output.children.get("Control").unwrap();
+
+        assert!(!power_child.hierarchical_labels.is_empty());
+        assert!(!control_child.hierarchical_labels.is_empty());
+        assert!(power_child.hierarchical_labels.iter().any(|label| label.text == "VCC"));
+        assert!(control_child.hierarchical_labels.iter().any(|label| label.text == "VCC"));
+    }
+
+    #[test]
+    fn test_compile_power_net_cross_sheet_without_sheet_pins() {
+        // Test that power nets (like GND, +3V3) automatically create hierarchical labels
+        // without requiring explicit sheet pin definitions
+        let yaml = r#"
+components:
+  U1:
+    symbol: Device:R
+    position: [100, 50]
+    sheet: Power
+  U2:
+    symbol: Device:R
+    position: [200, 50]
+    sheet: Control
+
+sheets:
+  Power:
+    path: power
+  Control:
+    path: control
+
+connections:
+  - net: GND
+    pins: [U1:1, U2:1]
+  - net: +3V3
+    pins: [U1:2, U2:2]
+"#;
+        let output = compile_yaml_str(yaml).unwrap();
+
+        let power_child = output.children.get("Power").unwrap();
+        let control_child = output.children.get("Control").unwrap();
+
+        // Without a declared sheet pin, a hierarchical label would have no matching pin on the
+        // parent sheet symbol (hier_label_mismatch in KiCAD ERC). Power nets instead get real
+        // global labels, which connect by name project-wide with no sheet pin required.
+        assert!(!power_child.global_labels.is_empty());
+        assert!(!control_child.global_labels.is_empty());
+        assert!(power_child.global_labels.iter().any(|label| label.text == "GND"));
+        assert!(control_child.global_labels.iter().any(|label| label.text == "GND"));
+        assert!(power_child.global_labels.iter().any(|label| label.text == "+3V3"));
+        assert!(control_child.global_labels.iter().any(|label| label.text == "+3V3"));
+    }
+
+    #[test]
+    fn test_compile_global_flag_cross_sheet_without_sheet_pins() {
+        // Test that connections marked global: true bypass sheet pin requirement
+        let yaml = r#"
+components:
+  U1:
+    symbol: Device:R
+    position: [100, 50]
+    sheet: Power
+  U2:
+    symbol: Device:R
+    position: [200, 50]
+    sheet: Control
+
+sheets:
+  Power:
+    path: power
+  Control:
+    path: control
+
+connections:
+  - net: DATA_BUS
+    global: true
+    pins: [U1:1, U2:1]
+"#;
+        let output = compile_yaml_str(yaml).unwrap();
+
+        let power_child = output.children.get("Power").unwrap();
+        let control_child = output.children.get("Control").unwrap();
+
+        // With global: true, even non-power nets bypass the sheet-pin requirement via real
+        // global labels (same reasoning as the power-net case above).
+        assert!(!power_child.global_labels.is_empty());
+        assert!(!control_child.global_labels.is_empty());
+        assert!(power_child.global_labels.iter().any(|label| label.text == "DATA_BUS"));
+        assert!(control_child.global_labels.iter().any(|label| label.text == "DATA_BUS"));
     }
 
     #[test]

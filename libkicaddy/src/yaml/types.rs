@@ -20,6 +20,10 @@ pub struct YamlSchematic {
     #[serde(default)]
     pub components: HashMap<String, ComponentDef>,
 
+    /// Hierarchical sheet definitions keyed by sheet name
+    #[serde(default)]
+    pub sheets: HashMap<String, SheetDef>,
+
     /// Top-level connections (merged with group connections)
     #[serde(default)]
     pub connections: Vec<Connection>,
@@ -99,9 +103,49 @@ pub struct ComponentDef {
     #[serde(default = "default_unit")]
     pub unit: u32,
 
+    /// Hierarchical sheet this component belongs to
+    #[serde(default)]
+    pub sheet: Option<String>,
+
     /// Additional properties (Footprint, etc.)
     #[serde(default)]
     pub properties: HashMap<String, String>,
+}
+
+/// Hierarchical sheet definition for a sub-schematic
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SheetDef {
+    /// Path or filename of the sub-schematic, e.g. "power" or "subcircuits/adc"
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Position in schematic coordinates
+    #[serde(default)]
+    pub position: Option<Position2D>,
+
+    /// Width and height in schematic units
+    #[serde(default)]
+    pub size: Option<[f64; 2]>,
+
+    /// Connection pins for this sheet symbol
+    #[serde(default)]
+    pub pins: Vec<SheetPinDef>,
+}
+
+/// Definition for a sheet symbol pin
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SheetPinDef {
+    /// Pin name shown on the sheet symbol
+    #[serde(default)]
+    pub name: String,
+
+    /// Pin shape, such as input/output/bidirectional
+    #[serde(default)]
+    pub shape: Option<String>,
+
+    /// Position in schematic coordinates
+    #[serde(default)]
+    pub position: Option<Position2D>,
 }
 
 fn default_unit() -> u32 {
