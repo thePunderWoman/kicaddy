@@ -126,7 +126,6 @@ impl Compiler {
 
         let all_components = yaml_sch.all_components();
         let all_connections = yaml_sch.all_connections();
-        let needs_layout = all_components.values().any(|c| c.position.is_none());
 
         let mut symbols: HashMap<String, Symbol> = HashMap::new();
         for (reference, component) in &all_components {
@@ -141,12 +140,6 @@ impl Compiler {
             }
         }
 
-        let computed_positions = if needs_layout {
-            self.compute_layout(yaml_sch, &all_components, &all_connections, &symbols)?
-        } else {
-            HashMap::new()
-        };
-
         let mut by_sheet: HashMap<String, Vec<(&String, &ComponentDef)>> = HashMap::new();
         for (reference, component) in &all_components {
             let sheet_name = component
@@ -156,6 +149,23 @@ impl Compiler {
                 .unwrap_or("__root__")
                 .to_string();
             by_sheet.entry(sheet_name).or_default().push((reference, component));
+        }
+
+        // Layout runs once *per sheet*, not once globally across every component in the yaml.
+        // A single global pass would place all components (99 in a real project) relative to
+        // each other on one shared page, then split them into child sheets afterward with their
+        // global-layout positions unchanged — so most components land far outside whichever
+        // individual sheet's page they actually end up on. Each sheet's own components (plus any
+        // left on the root) instead get their own fresh page and their own force-directed pass;
+        // cross-sheet connections are harmless to leave in since the layout algorithm silently
+        // skips edges whose other endpoint isn't in that pass's graph.
+        let mut computed_positions: HashMap<String, Point> = HashMap::new();
+        for entries in by_sheet.values() {
+            if entries.iter().any(|(_, component)| component.position.is_none()) {
+                let sheet_positions =
+                    self.compute_layout(yaml_sch, entries, &all_connections, &symbols)?;
+                computed_positions.extend(sheet_positions);
+            }
         }
 
         for (sheet_name, entries) in &by_sheet {
@@ -913,11 +923,14 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compute layout positions for components that don't have explicit positions
+    /// Compute layout positions for one sheet's worth of components (the root's own unsheeted
+    /// components count as a "sheet" here too) that don't have explicit positions. Called once
+    /// per sheet — see the comment at the call site for why a single global pass across every
+    /// component in the yaml doesn't work once components are split across sheets.
     fn compute_layout(
         &self,
         yaml_sch: &YamlSchematic,
-        all_components: &HashMap<String, ComponentDef>,
+        components: &[(&String, &ComponentDef)],
         all_connections: &[super::types::Connection],
         symbols: &HashMap<String, Symbol>,
     ) -> Result<HashMap<String, Point>, YamlError> {
@@ -932,7 +945,7 @@ impl Compiler {
         }
 
         // Create nodes for each component
-        for (reference, component) in all_components {
+        for &(reference, component) in components {
             let symbol = symbols.get(reference);
             let (width, height) = Self::calculate_symbol_bounds(symbol);
 
@@ -1515,6 +1528,69 @@ connections:
         assert!(!control_child.global_labels.is_empty());
         assert!(power_child.global_labels.iter().any(|label| label.text == "DATA_BUS"));
         assert!(control_child.global_labels.iter().any(|label| label.text == "DATA_BUS"));
+    }
+
+    #[test]
+    fn test_compile_auto_layout_stays_within_each_sheets_own_page() {
+        // Auto-layout used to run once globally across every component in the yaml, before
+        // components were split into their target sheets — so a sheet's components landed
+        // wherever the force-directed pass put them relative to *every other sheet's*
+        // components too, frequently well outside that sheet's own page bounds once split out.
+        // Each sheet must now get its own independent layout pass against its own page.
+        let yaml = r#"
+meta:
+  paper: A4
+
+components:
+  UA0:
+    symbol: Device:R
+  UA1:
+    symbol: Device:R
+  UA2:
+    symbol: Device:R
+  UA3:
+    symbol: Device:R
+  UB0:
+    symbol: Device:R
+    sheet: SideB
+  UB1:
+    symbol: Device:R
+    sheet: SideB
+  UB2:
+    symbol: Device:R
+    sheet: SideB
+  UB3:
+    symbol: Device:R
+    sheet: SideB
+
+sheets:
+  SideB:
+    path: side_b_layout_bounds
+
+connections:
+  - pins: [UA0:2, UA1:1]
+  - pins: [UA1:2, UA2:1]
+  - pins: [UA2:2, UA3:1]
+  - pins: [UB0:2, UB1:1]
+  - pins: [UB1:2, UB2:1]
+  - pins: [UB2:2, UB3:1]
+"#;
+        let output = compile_yaml_str(yaml).expect("compile_yaml_str failed");
+
+        let (paper_w, paper_h) = crate::layout::paper_dimensions("A4");
+        let assert_in_bounds = |label: &str, schematic: &Schematic| {
+            for symbol in &schematic.symbols {
+                let p = symbol.position;
+                assert!(
+                    p.x >= 0.0 && p.x <= paper_w && p.y >= 0.0 && p.y <= paper_h,
+                    "{label}: symbol {} placed at ({}, {}), outside the {paper_w}x{paper_h} A4 page",
+                    symbol.lib_id, p.x, p.y
+                );
+            }
+        };
+
+        assert_in_bounds("root (UA0-3)", &output.root);
+        assert_in_bounds("SideB (UB0-3)", output.children.get("SideB").unwrap());
     }
 
     #[test]
