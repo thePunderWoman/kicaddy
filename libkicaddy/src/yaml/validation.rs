@@ -60,6 +60,9 @@ pub fn validate(schematic: &YamlSchematic) -> ValidationResult {
     // Check for duplicate references
     validate_no_duplicate_references(schematic, &mut result);
 
+    // Validate sheet references
+    validate_sheet_references(schematic, &mut result);
+
     // Validate each component
     for (reference, component) in &all_components {
         validate_component(reference, component, &mut result);
@@ -197,6 +200,27 @@ fn validate_no_duplicate_references(schematic: &YamlSchematic, result: &mut Vali
 }
 
 /// Validate a component definition
+fn validate_sheet_references(schematic: &YamlSchematic, result: &mut ValidationResult) {
+    let all_components = schematic.all_components();
+    let valid_sheet_names: HashSet<String> = schematic.sheets.keys().cloned().collect();
+
+    for (reference, component) in &all_components {
+        if let Some(sheet_name) = &component.sheet {
+            if sheet_name.trim().is_empty() {
+                result.add_error(YamlError::Other(format!(
+                    "Component '{}' has an empty sheet reference",
+                    reference
+                )));
+            } else if !valid_sheet_names.contains(sheet_name) {
+                result.add_error(YamlError::Other(format!(
+                    "Component '{}' references sheet '{}' but no such sheet is defined",
+                    reference, sheet_name
+                )));
+            }
+        }
+    }
+}
+
 fn validate_component(
     reference: &str,
     component: &super::types::ComponentDef,
