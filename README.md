@@ -77,13 +77,7 @@ groups:
         pins: [U_LDO:VOUT, C_LDO_OUT:1]
       - net: GND
         pins: [U_LDO:GND, C_LDO_IN:2, C_LDO_OUT:2]
-```
-
-Output is a `.kicad_sch` file you can open in KiCAD, with `lib_symbols`
-populated, components placed on the grid, and labelled wires running between
-pins.
-
-### Bill of materials
+  - no_connect: [U_LDO:EN]
 
 ```
 $ kicaddy bom kato-turntable-controller.yaml

@@ -239,6 +239,7 @@ mod tests {
             in_bom: true,
             on_board: true,
             dnp: false,
+            power: false,
             fields_autoplaced: true,
             uuid: "r1-uuid".to_string(),
             properties: vec![Property {
@@ -261,6 +262,7 @@ mod tests {
             in_bom: true,
             on_board: true,
             dnp: false,
+            power: false,
             fields_autoplaced: true,
             uuid: "c1-uuid".to_string(),
             properties: vec![Property {

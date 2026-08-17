@@ -338,6 +338,7 @@ impl Schematic {
             in_bom: symbol.in_bom,
             on_board: symbol.on_board,
             dnp: false,
+            power: false,
             fields_autoplaced: true,
             uuid: uuid::Uuid::new_v4().to_string(),
             properties,
@@ -516,6 +517,20 @@ impl Schematic {
             uuid: uuid::Uuid::new_v4().to_string(),
         };
         self.junctions.push(junction);
+    }
+
+    /// Add a no-connect marker at a point (snapped to the KiCAD grid)
+    pub fn add_no_connect(&mut self, position: Point) {
+        const GRID: f64 = 1.27;
+        let snapped = Point::new(
+            (position.x / GRID).round() * GRID,
+            (position.y / GRID).round() * GRID,
+        );
+
+        self.no_connects.push(NoConnect {
+            position: snapped,
+            uuid: uuid::Uuid::new_v4().to_string(),
+        });
     }
 
     /// Add local label
@@ -978,6 +993,8 @@ pub struct SymbolInstance {
     pub on_board: bool,
     /// Do Not Populate flag
     pub dnp: bool,
+    /// Power symbol flag
+    pub power: bool,
     /// Whether fields are auto-placed
     pub fields_autoplaced: bool,
     /// Unique identifier
