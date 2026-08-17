@@ -97,6 +97,15 @@ impl Compiler {
         let mut children: HashMap<String, Schematic> = HashMap::new();
         let mut components_placed = HashMap::new();
         let mut connections_made = 0;
+        let mut warnings = validation.warnings;
+        // Declared sheet pins that a connection actually wired up. `place_sheet` puts every
+        // declared pin onto the sheet symbol unconditionally (it runs before connections are
+        // processed and doesn't know yet which will be used), but a pin only ends up with a
+        // matching hierarchical label when some cross-sheet connection references it — a
+        // same-sheet-only connection, or no connection at all, never touches this path. Left
+        // in place, such a pin has nothing inside the child sheet pointing back at it, so KiCAD
+        // reports hier_label_mismatch. Tracked here so unused ones can be dropped afterward.
+        let mut used_sheet_pins: HashSet<(String, String)> = HashSet::new();
 
         self.apply_meta(&mut root, &yaml_sch.meta)?;
 
@@ -325,6 +334,7 @@ impl Compiler {
                         .and_then(|s| s.pins.iter().find(|p| p.name == declared_pin.name))
                     {
                         hierarchical_targets.push(Point::new(placed_pin.position.x, placed_pin.position.y));
+                        used_sheet_pins.insert((sheet_name.clone(), declared_pin.name.clone()));
                     }
 
                     for (reference, pin) in pins_in_sheet {
@@ -432,6 +442,23 @@ impl Compiler {
             connections_made += 1;
         }
 
+        // Drop any declared sheet pin that no connection actually wired up (see the comment on
+        // `used_sheet_pins` above) rather than shipping a schematic KiCAD will flag as broken.
+        for sheet in &mut root.sheets {
+            let sheet_name = sheet.sheet_name.clone();
+            sheet.pins.retain(|pin| {
+                let used = used_sheet_pins.contains(&(sheet_name.clone(), pin.name.clone()));
+                if !used {
+                    warnings.push(format!(
+                        "Sheet '{}' declares pin '{}' but no connection wires it up (same-sheet \
+                         connections don't reach it, and neither does an unused declaration) — omitted",
+                        sheet_name, pin.name
+                    ));
+                }
+                used
+            });
+        }
+
         let root_schematic = root.clone();
         Ok(CompileOutput {
             root: root_schematic.clone(),
@@ -439,7 +466,7 @@ impl Compiler {
             schematic: root_schematic,
             components_placed,
             connections_made,
-            warnings: validation.warnings,
+            warnings,
         })
     }
 
@@ -775,6 +802,12 @@ impl Compiler {
                 // bounds — the sheet's width/height are rarely exact multiples of the grid
                 // (e.g. a 200mm-wide sheet), so comparing already-snapped values against an
                 // unsnapped edge would miss the match entirely.
+                //
+                // A pin that isn't on any edge at all (interior point, typo, or a sheet with
+                // no explicit position/size so it defaults to (0,0)-(200,150)) can't be wired
+                // correctly no matter what angle is guessed — it silently produces
+                // wire_dangling/pin_not_connected in kicad-cli sch erc with no indication why.
+                // Fail loudly here instead, at the point where the bad coordinate is known.
                 const EPS: f64 = 0.01;
                 let angle = if (raw_x - position.x).abs() < EPS {
                     180.0
@@ -785,7 +818,14 @@ impl Compiler {
                 } else if (raw_y - (position.y + size.1)).abs() < EPS {
                     270.0
                 } else {
-                    180.0
+                    return Err(YamlError::Other(format!(
+                        "Sheet '{}' pin '{}' at ({}, {}) is not on the border of the sheet rectangle \
+                         ({}, {}) to ({}, {}) — sheet pins must sit exactly on the left/right/top/bottom \
+                         edge (within {} units) or KiCAD can't wire them",
+                        sheet_name, pin.name, raw_x, raw_y,
+                        position.x, position.y, position.x + size.0, position.y + size.1,
+                        EPS
+                    )));
                 };
 
                 // Snapped to match the grid every wire endpoint is snapped to (see
@@ -795,16 +835,16 @@ impl Compiler {
                 let x = snap_to_grid(raw_x);
                 let y = snap_to_grid(raw_y);
 
-                crate::schematic::SheetPin {
+                Ok(crate::schematic::SheetPin {
                     name: pin.name.clone(),
                     shape: crate::schematic::LabelShape::from_str(
                         pin.shape.as_deref().unwrap_or("input"),
                     ),
                     position: Position::new(x, y, angle),
                     uuid: uuid::Uuid::new_v4().to_string(),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, YamlError>>()?;
 
         schematic.sheets.push(crate::schematic::Sheet {
             position,
@@ -1191,10 +1231,12 @@ components:
 sheets:
   Power:
     path: power
+    position: [0, 0]
+    size: [200, 150]
     pins:
       - name: VCC
         shape: output
-        position: [10, 10]
+        position: [0, 50]
 
 connections:
   - net: VCC
@@ -1204,6 +1246,12 @@ connections:
         let power_child = output.children.get("Power").unwrap();
 
         assert!(!power_child.wires.is_empty() || !power_child.labels.is_empty() || !power_child.global_labels.is_empty());
+
+        // The declared VCC pin sits on a valid edge, but only a same-sheet connection ever
+        // references it — no cross-sheet connection wires it up, so it should be dropped rather
+        // than left as a dangling sheet pin, with a warning explaining why.
+        assert!(output.root.sheets[0].pins.is_empty());
+        assert!(output.warnings.iter().any(|w| w.contains("VCC") && w.contains("Power")));
     }
 
     #[test]
@@ -1222,16 +1270,20 @@ components:
 sheets:
   Power:
     path: power
+    position: [0, 0]
+    size: [200, 150]
     pins:
       - name: VCC
         shape: output
-        position: [10, 10]
+        position: [200, 50]
   Control:
     path: control
+    position: [250, 0]
+    size: [200, 150]
     pins:
       - name: VCC
         shape: input
-        position: [20, 10]
+        position: [250, 50]
 
 connections:
   - net: VCC
