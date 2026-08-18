@@ -268,7 +268,15 @@ impl Compiler {
             // pin, so anything on the root that shares the net has to be physically wired to that
             // pin's exact position (not just labeled) or it stays electrically isolated.
             let mut hierarchical_targets: Vec<Point> = Vec::new();
-            for sheet_name in sheet_names.iter() {
+            // Sorted: `sheet_names` is a HashSet, whose iteration order is randomized per
+            // process. The first sheet visited here determines which point becomes the wiring
+            // "hub" (root_side_points[0]) below, so an unsorted order means the exact same yaml
+            // can compile to a different (though still electrically valid) wire topology on
+            // different invocations — sorting makes which sheet is treated as the hub
+            // deterministic given identical input.
+            let mut sorted_sheet_names: Vec<&String> = sheet_names.iter().collect();
+            sorted_sheet_names.sort();
+            for sheet_name in sorted_sheet_names {
                 if sheet_name == "__root__" {
                     continue;
                 }
