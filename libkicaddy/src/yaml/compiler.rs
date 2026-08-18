@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::commands::{snap_to_grid, Command, ConnectCommand};
-use crate::common::{Point, Position};
+use crate::common::{Point, Position, Property};
 use crate::config::KicadConfig;
 use crate::layout::{paper_dimensions, ForceDirectedLayout, LayoutConfig, LayoutEdge, LayoutGraph, LayoutNode, PinInfo};
 use crate::schematic::{Mirror, PaperSize, Schematic, TitleBlock};
@@ -815,6 +815,28 @@ impl Compiler {
             }
         }
 
+        // Apply footprint override if specified. Without this, `add_symbol` leaves whatever
+        // default Footprint property the library symbol itself carries (often blank for stock
+        // symbols like Device:R) — the yaml's `footprint:` was silently never applied at all.
+        if let Some(ref footprint) = component.footprint {
+            if let Some(sym) = schematic.symbols.iter_mut().find(|s| {
+                s.properties
+                    .iter()
+                    .any(|p| p.name == "Reference" && p.value == actual_ref)
+            }) {
+                if let Some(prop) = sym.properties.iter_mut().find(|p| p.name == "Footprint") {
+                    prop.value = footprint.clone();
+                } else {
+                    sym.properties.push(Property {
+                        name: "Footprint".to_string(),
+                        value: footprint.clone(),
+                        position: None,
+                        effects: None,
+                    });
+                }
+            }
+        }
+
         Ok(lib_id)
     }
 
@@ -1218,6 +1240,42 @@ connections:
         let output = result.unwrap();
         // GND is a power net, should create a global label
         assert!(!output.schematic.global_labels.is_empty() || !output.schematic.labels.is_empty());
+    }
+
+    #[test]
+    fn test_compile_component_footprint_override() {
+        // The yaml's `footprint:` used to be silently ignored entirely — add_symbol left
+        // whatever default Footprint property the library symbol itself carries (blank, for
+        // stock symbols like Device:R), and nothing ever applied the yaml's explicit value.
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+    footprint: Resistor_SMD:R_0402_1005Metric
+  R2:
+    symbol: Device:R
+    position: [150, 50]
+    value: 4.7k
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        let footprint = |reference: &str| {
+            output
+                .schematic
+                .symbols
+                .iter()
+                .find(|s| s.properties.iter().any(|p| p.name == "Reference" && p.value == reference))
+                .and_then(|s| s.properties.iter().find(|p| p.name == "Footprint"))
+                .map(|p| p.value.clone())
+        };
+
+        assert_eq!(footprint("R1").as_deref(), Some("Resistor_SMD:R_0402_1005Metric"));
+        // R2 has no footprint: override — confirm this doesn't leak R1's value onto it.
+        assert_ne!(footprint("R2").as_deref(), Some("Resistor_SMD:R_0402_1005Metric"));
     }
 
     #[test]

@@ -99,6 +99,11 @@ pub struct ComponentDef {
     #[serde(default)]
     pub value: Option<String>,
 
+    /// Footprint in Library:Footprint format (e.g., "Resistor_SMD:R_0402_1005Metric").
+    /// Overrides whatever default Footprint property the library symbol itself carries.
+    #[serde(default)]
+    pub footprint: Option<String>,
+
     /// Unit number for multi-unit symbols (default: 1)
     #[serde(default = "default_unit")]
     pub unit: u32,
@@ -127,7 +132,7 @@ pub struct ComponentDef {
     #[serde(default)]
     pub power: bool,
 
-    /// Additional properties (Footprint, etc.)
+    /// Additional properties beyond the well-known ones (Reference/Value/Footprint/etc.)
     #[serde(default)]
     pub properties: HashMap<String, String>,
 }
