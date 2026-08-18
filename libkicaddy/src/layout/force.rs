@@ -114,8 +114,15 @@ impl ForceDirectedLayout {
         let mut forces: Vec<(String, Point)> = Vec::new();
         let k = self.config.ideal_distance;
 
-        // Get references for iteration
-        let references: Vec<String> = graph.nodes.keys().cloned().collect();
+        // Get references for iteration. `graph.nodes` is a HashMap, whose iteration order is
+        // randomized per process — sorted here so the repulsive-force summation below happens in
+        // the same order every run. Floating-point addition isn't strictly associative, so an
+        // unsorted order can make the exact same yaml settle into a very slightly different final
+        // position across separate `kicaddy compile` invocations, which occasionally lands on the
+        // opposite side of a grid-snap boundary from the previous run — a real, if rare, source of
+        // a compiled schematic changing between identical recompiles.
+        let mut references: Vec<String> = graph.nodes.keys().cloned().collect();
+        references.sort();
 
         for reference in &references {
             let node = match graph.get_node(reference) {
@@ -427,7 +434,10 @@ impl ForceDirectedLayout {
 
         for _pass in 0..max_passes {
             let mut any_violation = false;
-            let refs: Vec<String> = graph.nodes.keys().cloned().collect();
+            // Sorted for the same determinism reason as calculate_forces_with_center above —
+            // which node in a violating pair gets pushed which way is order-sensitive.
+            let mut refs: Vec<String> = graph.nodes.keys().cloned().collect();
+            refs.sort();
 
             for i in 0..refs.len() {
                 for j in (i + 1)..refs.len() {

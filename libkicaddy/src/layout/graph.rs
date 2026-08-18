@@ -250,10 +250,18 @@ impl LayoutGraph {
 
     /// Get all nodes in a specific group
     pub fn nodes_in_group(&self, group: Option<&str>) -> Vec<&LayoutNode> {
-        self.nodes
+        let mut nodes: Vec<&LayoutNode> = self
+            .nodes
             .values()
             .filter(|n| n.group.as_deref() == group)
-            .collect()
+            .collect();
+        // `self.nodes` is a HashMap, so its iteration order is randomized per process. This
+        // feeds directly into group_centroid's floating-point summation — unsorted, the exact
+        // same yaml can settle into a very slightly different centroid on different compiler
+        // invocations (summation isn't strictly associative), which after enough force-simulation
+        // iterations can nudge a node across a grid-snap boundary. Sorting makes it deterministic.
+        nodes.sort_by(|a, b| a.reference.cmp(&b.reference));
+        nodes
     }
 
     /// Get all unique group names
