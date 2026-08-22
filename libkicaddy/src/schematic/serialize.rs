@@ -699,15 +699,14 @@ impl ToSExpr for Sheet {
             items.push(pin.to_sexpr());
         }
 
-        // Instances (hierarchical path/page bookkeeping) — omitted entirely when empty,
-        // which is what previously made KiCad show "was automatically fixed, please save"
-        // on every first open of a freshly compiled file.
+        // Instances (page-number bookkeeping) — omitted when empty so a standalone Sheet built
+        // outside compile() doesn't emit an empty `(instances)` block.
         if !self.instances.is_empty() {
-            let mut inst_items = vec![SExpr::symbol("instances")];
-            for inst in &self.instances {
-                inst_items.push(inst.to_sexpr());
+            let mut instance_items = vec![SExpr::symbol("instances")];
+            for instance in &self.instances {
+                instance_items.push(instance.to_sexpr());
             }
-            items.push(SExpr::list(inst_items));
+            items.push(SExpr::list(instance_items));
         }
 
         SExpr::list(items)
