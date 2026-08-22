@@ -68,18 +68,36 @@ pub struct LayoutOutput {
 /// Compiler for YAML schematic definitions
 pub struct Compiler {
     config: KicadConfig,
+    project_name: Option<String>,
 }
 
 impl Compiler {
     /// Create a new compiler with auto-detected KiCAD configuration
     pub fn new() -> Result<Self, YamlError> {
         let config = KicadConfig::detect()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            project_name: None,
+        })
     }
 
     /// Create a new compiler with a specific KiCAD configuration
     pub fn with_config(config: KicadConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            project_name: None,
+        }
+    }
+
+    /// Set the project name written into every hierarchical `instances` block (component
+    /// instances, sheet instances). Real KiCad uses the project's `.kicad_pro`/root schematic
+    /// file stem here; since kicaddy has no `.kicad_pro` concept of its own, callers that know
+    /// the eventual output filename (the CLI, the MCP tool) should derive it from that and set
+    /// it before calling `compile()`. Left unset, every `instances` block gets an empty project
+    /// name — real KiCad tolerates that, but the GUI won't display a real project name for it.
+    pub fn with_project_name(mut self, project_name: impl Into<String>) -> Self {
+        self.project_name = Some(project_name.into());
+        self
     }
 
     /// Compile a YAML schematic definition into KiCAD schematics.
@@ -113,6 +131,12 @@ impl Compiler {
         let hierarchy_root_uuid = uuid::Uuid::new_v4().to_string();
         root.hierarchy_root_uuid = Some(hierarchy_root_uuid.clone());
 
+        // Written into every `instances` block below (component instances, sheet instances).
+        // Empty when the caller never set one via `with_project_name` — real KiCad tolerates
+        // that, it just won't show a real project name for these entries in the GUI.
+        let project_name = self.project_name.clone().unwrap_or_default();
+        root.project_name = project_name.clone();
+
         self.apply_meta(&mut root, &yaml_sch.meta)?;
 
         // Sorted: `yaml_sch.sheets` is a HashMap, whose iteration order is randomized per
@@ -129,6 +153,7 @@ impl Compiler {
             self.place_sheet(&mut root, sheet_name, sheet_def)?;
             let mut child = Schematic::new();
             self.apply_meta(&mut child, &yaml_sch.meta)?;
+            child.project_name = project_name.clone();
             // Real KiCad child sheet files carry no `sheet_instances` block at all — only the
             // root file declares itself as page 1. The page-number/instances bookkeeping for
             // *this* sheet lives in the root's own `(sheet ...)` block instead (set below).
@@ -140,7 +165,7 @@ impl Compiler {
                     Some(Self::sheet_instance_path(&hierarchy_root_uuid, &sheet.uuid));
 
                 sheet.instances = vec![crate::schematic::SheetProjectInstance {
-                    project_name: String::new(),
+                    project_name: project_name.clone(),
                     paths: vec![crate::schematic::SheetInstance {
                         path: format!("/{}", hierarchy_root_uuid),
                         page,
@@ -1528,6 +1553,58 @@ sheets:
         assert_eq!(
             u1.instances[0].paths[0].path,
             format!("/{}/{}", hierarchy_root_uuid, sheet.uuid)
+        );
+    }
+
+    #[test]
+    fn test_compile_project_name_propagates_to_every_instances_block() {
+        // Left unset, every `instances` block's project name is "" — real KiCad tolerates that,
+        // but the user wants a real name preserved through recompiles rather than left blank
+        // whenever the caller (CLI/MCP) knows the eventual output filename. `with_project_name`
+        // is how that value gets in; verify it reaches root's own components, a child sheet's
+        // components, and the root sheet block's own instances entry — every place a project
+        // name is written.
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+  U1:
+    symbol: Device:R
+    position: [100, 50]
+    sheet: Power
+
+sheets:
+  Power:
+    path: power
+    position: [0, 0]
+    size: [200, 150]
+"#;
+        let yaml_sch = YamlSchematic::from_str(yaml).unwrap();
+        let compiler = Compiler::new()
+            .unwrap()
+            .with_project_name("snips_controller");
+        let result = compiler.compile(&yaml_sch);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+
+        let r1 = output
+            .root
+            .find_symbol_by_reference("R1")
+            .expect("R1 should be placed");
+        assert_eq!(r1.instances[0].project_name, "snips_controller");
+
+        let child = output.children.get("Power").unwrap();
+        let u1 = child
+            .find_symbol_by_reference("U1")
+            .expect("U1 should be placed");
+        assert_eq!(u1.instances[0].project_name, "snips_controller");
+
+        assert_eq!(
+            output.root.sheets[0].instances[0].project_name,
+            "snips_controller"
         );
     }
 
