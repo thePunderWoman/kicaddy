@@ -1289,6 +1289,58 @@ fn parse_project_instances(sexpr: &SExpr) -> Result<Vec<ProjectInstance>, Schema
     Ok(instances)
 }
 
+fn parse_sheet_project_instances(sexpr: &SExpr) -> Result<Vec<SheetProjectInstance>, SchematicError> {
+    let items = sexpr.as_list_starting_with("instances").ok_or_else(|| {
+        SchematicError::InvalidFormat {
+            expected: "instances".to_string(),
+            got: format!("{:?}", sexpr),
+        }
+    })?;
+
+    let mut instances = Vec::new();
+
+    for item in items {
+        if let Some(project_args) = item.as_list_starting_with("project") {
+            let project_name = project_args
+                .first()
+                .and_then(|e| e.as_string())
+                .unwrap_or("")
+                .to_string();
+
+            let mut paths = Vec::new();
+            for arg in &project_args[1..] {
+                if let Some(path_args) = arg.as_list_starting_with("path") {
+                    let path = path_args
+                        .first()
+                        .and_then(|e| e.as_string())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let mut page = String::new();
+                    for p in &path_args[1..] {
+                        if let Some(page_args) = p.as_list_starting_with("page") {
+                            page = page_args
+                                .first()
+                                .and_then(|e| e.as_string())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                    }
+
+                    paths.push(SheetInstance { path, page });
+                }
+            }
+
+            instances.push(SheetProjectInstance {
+                project_name,
+                paths,
+            });
+        }
+    }
+
+    Ok(instances)
+}
+
 fn parse_sheet(sexpr: &SExpr) -> Result<Sheet, SchematicError> {
     let items = sexpr.as_list_starting_with("sheet").ok_or_else(|| {
         SchematicError::InvalidFormat {
@@ -1308,6 +1360,7 @@ fn parse_sheet(sexpr: &SExpr) -> Result<Sheet, SchematicError> {
     let mut in_bom = true;
     let mut on_board = true;
     let mut fields_autoplaced = false;
+    let mut instances = Vec::new();
 
     for item in items {
         if let Some(args) = item.as_list_starting_with("at") {
@@ -1344,6 +1397,8 @@ fn parse_sheet(sexpr: &SExpr) -> Result<Sheet, SchematicError> {
             on_board = args.first().and_then(|e| e.as_symbol()) != Some("no");
         } else if item.is_list_starting_with("fields_autoplaced") {
             fields_autoplaced = true;
+        } else if item.is_list_starting_with("instances") {
+            instances = parse_sheet_project_instances(item)?;
         }
     }
 
@@ -1359,6 +1414,7 @@ fn parse_sheet(sexpr: &SExpr) -> Result<Sheet, SchematicError> {
         in_bom,
         on_board,
         fields_autoplaced,
+        instances,
     })
 }
 

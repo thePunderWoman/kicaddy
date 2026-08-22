@@ -107,17 +107,44 @@ impl Compiler {
         // reports hier_label_mismatch. Tracked here so unused ones can be dropped afterward.
         let mut used_sheet_pins: HashSet<(String, String)> = HashSet::new();
 
+        // The uuid every hierarchical instance path (component `instances`, a sheet symbol's own
+        // `instances`) chains from — deliberately *not* `root.uuid`. See
+        // `Schematic::hierarchy_root_uuid`'s doc comment for why the two must stay distinct.
+        let hierarchy_root_uuid = uuid::Uuid::new_v4().to_string();
+        root.hierarchy_root_uuid = Some(hierarchy_root_uuid.clone());
+
         self.apply_meta(&mut root, &yaml_sch.meta)?;
 
-        for (sheet_name, sheet_def) in &yaml_sch.sheets {
+        // Sorted: `yaml_sch.sheets` is a HashMap, whose iteration order is randomized per
+        // process — using it directly would assign a different page number to each sheet on
+        // every recompile even when the yaml is unchanged (same non-determinism class as the
+        // force-directed layout / cross-sheet wiring hub bugs fixed earlier).
+        let mut sorted_sheet_names: Vec<&String> = yaml_sch.sheets.keys().collect();
+        sorted_sheet_names.sort();
+
+        // Page 1 is reserved for the root; each child sheet gets the next one, in sorted-name
+        // order, matching how real KiCad numbers sheets in a project.
+        for (index, sheet_name) in sorted_sheet_names.into_iter().enumerate() {
+            let sheet_def = &yaml_sch.sheets[sheet_name];
             self.place_sheet(&mut root, sheet_name, sheet_def)?;
             let mut child = Schematic::new();
             self.apply_meta(&mut child, &yaml_sch.meta)?;
+            // Real KiCad child sheet files carry no `sheet_instances` block at all — only the
+            // root file declares itself as page 1. The page-number/instances bookkeeping for
+            // *this* sheet lives in the root's own `(sheet ...)` block instead (set below).
+            child.sheet_instances = Vec::new();
 
-            if let Some(sheet) = root.sheets.iter().find(|s| s.sheet_name == *sheet_name) {
-                child.sheet_instances = vec![crate::schematic::SheetInstance {
-                    path: Self::sheet_instance_path(&root.uuid, &sheet.uuid),
-                    page: "1".to_string(),
+            if let Some(sheet) = root.sheets.iter_mut().find(|s| s.sheet_name == *sheet_name) {
+                let page = (index + 2).to_string();
+                child.hierarchy_path_prefix =
+                    Some(Self::sheet_instance_path(&hierarchy_root_uuid, &sheet.uuid));
+
+                sheet.instances = vec![crate::schematic::SheetProjectInstance {
+                    project_name: String::new(),
+                    paths: vec![crate::schematic::SheetInstance {
+                        path: format!("/{}", hierarchy_root_uuid),
+                        page,
+                    }],
                 }];
             }
 
@@ -780,9 +807,11 @@ impl Compiler {
         Ok(lib_id)
     }
 
-    /// Build the KiCad sheet-instance path for a child sheet.
-    fn sheet_instance_path(root_uuid: &str, sheet_uuid: &str) -> String {
-        format!("/{}/{}", root_uuid, sheet_uuid)
+    /// Build the KiCad hierarchy path for a child sheet: `/{hierarchy_root_uuid}/{sheet_uuid}`.
+    /// `hierarchy_root_uuid` must be the project-wide hierarchy-path root uuid (see
+    /// `Schematic::hierarchy_root_uuid`), not any individual file's own uuid.
+    fn sheet_instance_path(hierarchy_root_uuid: &str, sheet_uuid: &str) -> String {
+        format!("/{}/{}", hierarchy_root_uuid, sheet_uuid)
     }
 
     /// Place a hierarchical sheet definition in the schematic
@@ -888,6 +917,9 @@ impl Compiler {
             in_bom: true,
             on_board: true,
             fields_autoplaced: false,
+            // Populated later in compile()'s sheets loop, once this sheet's page number is
+            // known.
+            instances: Vec::new(),
         });
 
         Ok(())
@@ -1242,10 +1274,42 @@ sheets:
         assert_eq!(output.children.len(), 1);
         assert!(output.children.contains_key("Power"));
 
+        // Real KiCad child sheet files carry no `sheet_instances` block at all — only the root
+        // file declares itself as page 1 (verified against real GUI-saved multi-sheet project
+        // files: only the root .kicad_sch had a top-level `sheet_instances`, none of 12 child
+        // files did).
         let child = output.children.get("Power").unwrap();
-        assert_eq!(child.sheet_instances.len(), 1);
-        assert!(child.sheet_instances[0].path.starts_with(&format!("/{}", output.root.uuid)));
-        assert!(child.sheet_instances[0].path.ends_with(&output.root.sheets[0].uuid));
+        assert_eq!(child.sheet_instances.len(), 0);
+
+        // The root's own sheet block carries the page-number bookkeeping instead: path is just
+        // "/{hierarchy_root_uuid}" (no sheet uuid suffix — that's what real KiCad emits for a
+        // sheet symbol's own instances entry, distinct from a *component's* instances path
+        // inside the child, which does include the sheet uuid).
+        let hierarchy_root_uuid = output
+            .root
+            .hierarchy_root_uuid
+            .as_ref()
+            .expect("compile() should always set hierarchy_root_uuid");
+        assert_ne!(hierarchy_root_uuid, &output.root.uuid);
+
+        let sheet = &output.root.sheets[0];
+        assert_eq!(sheet.instances.len(), 1);
+        assert_eq!(sheet.instances[0].paths.len(), 1);
+        assert_eq!(
+            sheet.instances[0].paths[0].path,
+            format!("/{}", hierarchy_root_uuid)
+        );
+        assert_eq!(sheet.instances[0].paths[0].page, "2");
+
+        // A component placed on the child sheet still needs the full chain (root + sheet uuid)
+        // in its own instances path.
+        let u1 = child
+            .find_symbol_by_reference("U1")
+            .expect("U1 should be placed");
+        assert_eq!(
+            u1.instances[0].paths[0].path,
+            format!("/{}/{}", hierarchy_root_uuid, sheet.uuid)
+        );
     }
 
     #[test]

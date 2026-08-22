@@ -98,15 +98,18 @@ fn compile_to_dir(yaml: &str, dir: &Path, root_name: &str) -> PathBuf {
     for (_sheet_name, child) in &output.children {
         // Every child's sheet_file (e.g. "power.kicad_sch") is already resolved with its
         // extension by the compiler; recover the matching root.sheets entry to name the file.
+        // Real KiCad child sheet files carry no `sheet_instances` block of their own (verified
+        // against real GUI-saved project files) — the hierarchy chain lives in
+        // `hierarchy_path_prefix` instead, which compile() sets but never serializes.
         let sheet = output
             .root
             .sheets
             .iter()
             .find(|s| {
                 child
-                    .sheet_instances
-                    .first()
-                    .map(|inst| inst.path.ends_with(&s.uuid))
+                    .hierarchy_path_prefix
+                    .as_deref()
+                    .map(|path| path.ends_with(&s.uuid))
                     .unwrap_or(false)
             })
             .expect("child schematic has no matching sheet entry");
