@@ -12,6 +12,7 @@ pub mod config;
 pub mod connectivity;
 pub mod layout;
 pub mod parser;
+pub mod project;
 pub mod schematic;
 pub mod search;
 pub mod symbol;
