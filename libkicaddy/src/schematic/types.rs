@@ -103,6 +103,21 @@ pub struct Schematic {
     pub sheets: Vec<Sheet>,
     /// Sheet instances (for hierarchical designs)
     pub sheet_instances: Vec<SheetInstance>,
+    /// The project-wide uuid every hierarchical instance path (component `instances`, child
+    /// `sheet_instances`, a sheet's own `instances`) chains from. Real KiCad tracks this
+    /// separately from any individual file's own `uuid` header field — it's stored in the
+    /// project's `.kicad_pro` as `schematic.top_level_sheets[0].uuid`. Using a file's own
+    /// `uuid` here instead produces a path KiCad silently discards and regenerates on first
+    /// GUI open ("was automatically fixed, please save"). `None` until `compile()` sets it;
+    /// only a schematic built directly (not via the yaml compiler) would leave this unset.
+    pub hierarchy_root_uuid: Option<String>,
+    /// For a child sheet's schematic, the full hierarchy path
+    /// (`/{hierarchy_root_uuid}/{sheet_uuid}`) that `add_symbol` uses to build each placed
+    /// component's `instances` path. `None` for the root schematic (whose components use
+    /// `hierarchy_root_uuid` alone) and for a standalone schematic built outside `compile()`.
+    /// Never serialized — real KiCad child sheet files carry no top-level path/page bookkeeping
+    /// of their own; that lives in the *root* file's per-sheet `instances` block instead.
+    pub hierarchy_path_prefix: Option<String>,
     /// Whether to embed fonts
     pub embedded_fonts: bool,
 }
@@ -137,6 +152,8 @@ impl Schematic {
                 path: "/".to_string(),
                 page: "1".to_string(),
             }],
+            hierarchy_root_uuid: None,
+            hierarchy_path_prefix: None,
             embedded_fonts: false,
         }
     }
@@ -306,12 +323,24 @@ impl Schematic {
             })
             .collect();
 
-        // Create project instance with reference
-        // The path is "/{schematic_uuid}" for the root sheet
+        // Create project instance with reference.
+        // For a child sheet's schematic, `hierarchy_path_prefix` (set by compile() before any
+        // symbols are placed into the child) is the full hierarchy-root-to-this-sheet uuid
+        // chain. For the true root schematic it's "/{hierarchy_root_uuid}" — NOT
+        // "/{self.uuid}". KiCad tracks the hierarchy-path root identity as a project-wide uuid
+        // separate from any individual file's own uuid (see `hierarchy_root_uuid`'s doc
+        // comment); falling back to `self.uuid` here is only correct for a standalone,
+        // non-hierarchical schematic that compile() never set `hierarchy_root_uuid` on at all.
+        let instance_path = self.hierarchy_path_prefix.clone().unwrap_or_else(|| {
+            format!(
+                "/{}",
+                self.hierarchy_root_uuid.as_deref().unwrap_or(&self.uuid)
+            )
+        });
         let project_instance = ProjectInstance {
             project_name: String::new(), // Empty project name for standalone schematics
             paths: vec![PathInstance {
-                path: format!("/{}", self.uuid),
+                path: instance_path,
                 reference: ref_value.clone(),
                 unit: 1,
             }],
@@ -1064,6 +1093,11 @@ pub struct Sheet {
     pub on_board: bool,
     /// Fields autoplaced
     pub fields_autoplaced: bool,
+    /// Instance/page-number bookkeeping for this sheet symbol, keyed by project name — mirrors
+    /// a placed component's `instances` block but for the sheet symbol itself. Real KiCad emits
+    /// one of these per `(sheet ...)` block; without it, the GUI reports the file as needing
+    /// automatic repair on first open (same class of issue `hierarchy_root_uuid` addresses).
+    pub instances: Vec<SheetProjectInstance>,
 }
 
 /// Sheet instance information
@@ -1071,6 +1105,13 @@ pub struct Sheet {
 pub struct SheetInstance {
     pub path: String,
     pub page: String,
+}
+
+/// Instance/page-number data for a sheet symbol, for a single project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SheetProjectInstance {
+    pub project_name: String,
+    pub paths: Vec<SheetInstance>,
 }
 
 /// Routing mode for wire placement

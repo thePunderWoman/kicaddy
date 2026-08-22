@@ -1025,15 +1025,31 @@ fn main() {
                 // Compile
                 match compiler.compile(&yaml_sch) {
                     Ok(compile_output) => {
-                        // Determine output path
                         let output_path = output.unwrap_or_else(|| {
                             yaml.with_extension("kicad_sch")
                         });
 
-                        // Write the schematic
-                        if let Err(e) = compile_output.schematic.write_to_file(&output_path) {
+                        if let Err(e) = compile_output.root.write_to_file(&output_path) {
                             eprintln!("Error writing schematic: {}", e);
                             std::process::exit(1);
+                        }
+
+                        for (sheet_name, child_schematic) in &compile_output.children {
+                            let sheet_file = yaml_sch
+                                .sheets
+                                .get(sheet_name)
+                                .and_then(|sheet| sheet.path.clone())
+                                .unwrap_or_else(|| sheet_name.clone());
+
+                            let child_path = output_path.with_file_name(if sheet_file.ends_with(".kicad_sch") {
+                                sheet_file
+                            } else {
+                                format!("{}.kicad_sch", sheet_file)
+                            });
+                            if let Err(e) = child_schematic.write_to_file(&child_path) {
+                                eprintln!("Error writing child sheet '{}': {}", sheet_name, e);
+                                std::process::exit(1);
+                            }
                         }
 
                         println!("Compiled {} to {}", yaml.display(), output_path.display());

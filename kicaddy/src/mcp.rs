@@ -390,8 +390,24 @@ fn execute_compile_yaml(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| path.with_extension("kicad_sch"));
 
-            compile_output.schematic.write_to_file(&out_path)
+            compile_output.root.write_to_file(&out_path)
                 .map_err(|e| format!("Failed to write schematic: {}", e))?;
+
+            for (sheet_name, child_schematic) in &compile_output.children {
+                let sheet_file = yaml_sch
+                    .sheets
+                    .get(sheet_name)
+                    .and_then(|sheet| sheet.path.clone())
+                    .unwrap_or_else(|| sheet_name.clone());
+                let child_path = out_path.with_file_name(if sheet_file.ends_with(".kicad_sch") {
+                    sheet_file
+                } else {
+                    format!("{}.kicad_sch", sheet_file)
+                });
+                child_schematic
+                    .write_to_file(&child_path)
+                    .map_err(|e| format!("Failed to write child sheet '{}': {}", sheet_name, e))?;
+            }
 
             let output = serde_json::json!({
                 "success": true,

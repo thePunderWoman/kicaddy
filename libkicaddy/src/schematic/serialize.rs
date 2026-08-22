@@ -554,6 +554,18 @@ impl ToSExpr for SheetInstance {
     }
 }
 
+impl ToSExpr for SheetProjectInstance {
+    fn to_sexpr(&self) -> SExpr {
+        let mut items = vec![SExpr::symbol("project"), SExpr::string(&self.project_name)];
+
+        for path in &self.paths {
+            items.push(path.to_sexpr());
+        }
+
+        SExpr::list(items)
+    }
+}
+
 impl ToSExpr for Sheet {
     fn to_sexpr(&self) -> SExpr {
         let mut items = vec![SExpr::symbol("sheet")];
@@ -685,6 +697,16 @@ impl ToSExpr for Sheet {
         // Pins
         for pin in &self.pins {
             items.push(pin.to_sexpr());
+        }
+
+        // Instances (page-number bookkeeping) — omitted when empty so a standalone Sheet built
+        // outside compile() doesn't emit an empty `(instances)` block.
+        if !self.instances.is_empty() {
+            let mut instance_items = vec![SExpr::symbol("instances")];
+            for instance in &self.instances {
+                instance_items.push(instance.to_sexpr());
+            }
+            items.push(SExpr::list(instance_items));
         }
 
         SExpr::list(items)
