@@ -1057,6 +1057,32 @@ fn main() {
                             }
                         }
 
+                        // Keep a pre-existing .kicad_pro's cached sheet UUID list in sync with
+                        // what was just written — otherwise it's stale until KiCad's GUI
+                        // silently self-corrects it on next open ("was automatically fixed").
+                        if let Some(hierarchy_root_uuid) = &compile_output.root.hierarchy_root_uuid {
+                            let root_sheet = libkicaddy::project::ProjectSheet {
+                                uuid: hierarchy_root_uuid.clone(),
+                                name: compile_output.root.project_name.clone(),
+                            };
+                            let child_sheets: Vec<_> = compile_output
+                                .root
+                                .sheets
+                                .iter()
+                                .map(|sheet| libkicaddy::project::ProjectSheet {
+                                    uuid: sheet.uuid.clone(),
+                                    name: sheet.sheet_name.clone(),
+                                })
+                                .collect();
+                            if let Err(e) = libkicaddy::project::sync_kicad_pro_sheets(
+                                &output_path,
+                                &root_sheet,
+                                &child_sheets,
+                            ) {
+                                eprintln!("Warning: failed to sync .kicad_pro: {}", e);
+                            }
+                        }
+
                         println!("Compiled {} to {}", yaml.display(), output_path.display());
                         println!(
                             "  Components placed: {}",
