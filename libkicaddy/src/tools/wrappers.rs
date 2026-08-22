@@ -1048,13 +1048,20 @@ impl Tool for CompileYamlTool {
             })
         } else {
             // Compile
+            // Determine output path
+            let output_path = input
+                .output_path
+                .unwrap_or_else(|| input.yaml_path.with_extension("kicad_sch"));
+            // Real KiCad projects derive their `instances` block project name from the
+            // .kicad_pro/root schematic file stem; kicaddy has no .kicad_pro of its own, so the
+            // output filename is the closest equivalent available here.
+            let compiler = match output_path.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) => compiler.with_project_name(stem),
+                None => compiler,
+            };
+
             match compiler.compile(&yaml_sch) {
                 Ok(compile_output) => {
-                    // Determine output path
-                    let output_path = input
-                        .output_path
-                        .unwrap_or_else(|| input.yaml_path.with_extension("kicad_sch"));
-
                     // Write the schematic
                     compile_output
                         .schematic

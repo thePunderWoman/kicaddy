@@ -118,6 +118,11 @@ pub struct Schematic {
     /// Never serialized — real KiCad child sheet files carry no top-level path/page bookkeeping
     /// of their own; that lives in the *root* file's per-sheet `instances` block instead.
     pub hierarchy_path_prefix: Option<String>,
+    /// Project name written into every `instances` block this schematic's `add_symbol` produces
+    /// (real KiCad uses the project's `.kicad_pro`/root schematic file stem here). Empty by
+    /// default — `compile()` sets it on both the root and every child schematic from
+    /// `Compiler::with_project_name`, when the caller provided one.
+    pub project_name: String,
     /// Whether to embed fonts
     pub embedded_fonts: bool,
 }
@@ -154,6 +159,7 @@ impl Schematic {
             }],
             hierarchy_root_uuid: None,
             hierarchy_path_prefix: None,
+            project_name: String::new(),
             embedded_fonts: false,
         }
     }
@@ -338,7 +344,7 @@ impl Schematic {
             )
         });
         let project_instance = ProjectInstance {
-            project_name: String::new(), // Empty project name for standalone schematics
+            project_name: self.project_name.clone(),
             paths: vec![PathInstance {
                 path: instance_path,
                 reference: ref_value.clone(),

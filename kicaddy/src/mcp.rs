@@ -384,12 +384,19 @@ fn execute_compile_yaml(
         return serde_json::to_string_pretty(&output).map_err(|e| e.to_string());
     }
 
+    let out_path = output_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.with_extension("kicad_sch"));
+    // Real KiCad projects derive their `instances` block project name from the
+    // .kicad_pro/root schematic file stem; kicaddy has no .kicad_pro of its own, so the
+    // output filename is the closest equivalent available here.
+    let compiler = match out_path.file_stem().and_then(|s| s.to_str()) {
+        Some(stem) => compiler.with_project_name(stem),
+        None => compiler,
+    };
+
     match compiler.compile(&yaml_sch) {
         Ok(compile_output) => {
-            let out_path = output_path
-                .map(PathBuf::from)
-                .unwrap_or_else(|| path.with_extension("kicad_sch"));
-
             compile_output.root.write_to_file(&out_path)
                 .map_err(|e| format!("Failed to write schematic: {}", e))?;
 
