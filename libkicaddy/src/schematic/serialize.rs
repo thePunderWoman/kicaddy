@@ -554,6 +554,18 @@ impl ToSExpr for SheetInstance {
     }
 }
 
+impl ToSExpr for SheetProjectInstance {
+    fn to_sexpr(&self) -> SExpr {
+        let mut items = vec![SExpr::symbol("project"), SExpr::string(&self.project_name)];
+
+        for path in &self.paths {
+            items.push(path.to_sexpr());
+        }
+
+        SExpr::list(items)
+    }
+}
+
 impl ToSExpr for Sheet {
     fn to_sexpr(&self) -> SExpr {
         let mut items = vec![SExpr::symbol("sheet")];
@@ -685,6 +697,17 @@ impl ToSExpr for Sheet {
         // Pins
         for pin in &self.pins {
             items.push(pin.to_sexpr());
+        }
+
+        // Instances (hierarchical path/page bookkeeping) — omitted entirely when empty,
+        // which is what previously made KiCad show "was automatically fixed, please save"
+        // on every first open of a freshly compiled file.
+        if !self.instances.is_empty() {
+            let mut inst_items = vec![SExpr::symbol("instances")];
+            for inst in &self.instances {
+                inst_items.push(inst.to_sexpr());
+            }
+            items.push(SExpr::list(inst_items));
         }
 
         SExpr::list(items)

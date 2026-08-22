@@ -107,6 +107,12 @@ impl Compiler {
         // reports hier_label_mismatch. Tracked here so unused ones can be dropped afterward.
         let mut used_sheet_pins: HashSet<(String, String)> = HashSet::new();
 
+        // The uuid every hierarchical instance path (component `instances`, child
+        // `sheet_instances`) chains from — deliberately *not* `root.uuid`. See
+        // `Schematic::hierarchy_root_uuid`'s doc comment for why the two must stay distinct.
+        let hierarchy_root_uuid = uuid::Uuid::new_v4().to_string();
+        root.hierarchy_root_uuid = Some(hierarchy_root_uuid.clone());
+
         self.apply_meta(&mut root, &yaml_sch.meta)?;
 
         for (sheet_name, sheet_def) in &yaml_sch.sheets {
@@ -116,7 +122,7 @@ impl Compiler {
 
             if let Some(sheet) = root.sheets.iter().find(|s| s.sheet_name == *sheet_name) {
                 child.sheet_instances = vec![crate::schematic::SheetInstance {
-                    path: Self::sheet_instance_path(&root.uuid, &sheet.uuid),
+                    path: Self::sheet_instance_path(&hierarchy_root_uuid, &sheet.uuid),
                     page: "1".to_string(),
                 }];
             }
@@ -840,9 +846,11 @@ impl Compiler {
         Ok(lib_id)
     }
 
-    /// Build the KiCad sheet-instance path for a child sheet.
-    fn sheet_instance_path(root_uuid: &str, sheet_uuid: &str) -> String {
-        format!("/{}/{}", root_uuid, sheet_uuid)
+    /// Build the KiCad sheet-instance path for a child sheet: `/{hierarchy_root_uuid}/{sheet_uuid}`.
+    /// `hierarchy_root_uuid` must be the project-wide hierarchy-path root uuid (see
+    /// `Schematic::hierarchy_root_uuid`), not any individual file's own uuid.
+    fn sheet_instance_path(hierarchy_root_uuid: &str, sheet_uuid: &str) -> String {
+        format!("/{}/{}", hierarchy_root_uuid, sheet_uuid)
     }
 
     /// Place a hierarchical sheet definition in the schematic
@@ -948,6 +956,7 @@ impl Compiler {
             in_bom: true,
             on_board: true,
             fields_autoplaced: false,
+            instances: Vec::new(),
         });
 
         Ok(())
@@ -1279,6 +1288,43 @@ components:
     }
 
     #[test]
+    fn test_compile_component_instance_path_uses_hierarchy_root_uuid_not_file_uuid() {
+        // A placed component's `instances` path used to chain from the schematic file's own
+        // `uuid` header field. Real KiCad tracks the hierarchy-path root as a separate,
+        // project-wide uuid (in a real project, .kicad_pro's
+        // schematic.top_level_sheets[0].uuid) — using the file's own uuid instead produces a
+        // path KiCad silently discards and regenerates on first GUI open ("was automatically
+        // fixed, please save"), even for a single-sheet, non-hierarchical schematic like this.
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        let hierarchy_root_uuid = output
+            .schematic
+            .hierarchy_root_uuid
+            .as_ref()
+            .expect("compile() should always set hierarchy_root_uuid");
+        assert_ne!(hierarchy_root_uuid, &output.schematic.uuid);
+
+        let r1 = output
+            .schematic
+            .find_symbol_by_reference("R1")
+            .expect("R1 should be placed");
+        assert_eq!(r1.instances.len(), 1);
+        assert_eq!(
+            r1.instances[0].paths[0].path,
+            format!("/{}", hierarchy_root_uuid)
+        );
+    }
+
+    #[test]
     fn test_compile_invalid_symbol() {
         let yaml = r#"
 components:
@@ -1426,7 +1472,15 @@ sheets:
 
         let child = output.children.get("Power").unwrap();
         assert_eq!(child.sheet_instances.len(), 1);
-        assert!(child.sheet_instances[0].path.starts_with(&format!("/{}", output.root.uuid)));
+        // Chains from the project-wide hierarchy_root_uuid, not root's own file uuid — see
+        // `Schematic::hierarchy_root_uuid`'s doc comment.
+        let hierarchy_root_uuid = output
+            .root
+            .hierarchy_root_uuid
+            .as_ref()
+            .expect("compile() should always set hierarchy_root_uuid");
+        assert_ne!(hierarchy_root_uuid, &output.root.uuid);
+        assert!(child.sheet_instances[0].path.starts_with(&format!("/{}", hierarchy_root_uuid)));
         assert!(child.sheet_instances[0].path.ends_with(&output.root.sheets[0].uuid));
     }
 
