@@ -91,6 +91,11 @@ impl Compiler {
         let mut components_placed = HashMap::new();
         let mut connections_made = 0;
 
+        // The uuid every component's hierarchical `instances` path chains from — deliberately
+        // *not* `schematic.uuid`. See `Schematic::hierarchy_root_uuid`'s doc comment for why
+        // the two must stay distinct even for a single-sheet, non-hierarchical schematic.
+        schematic.hierarchy_root_uuid = Some(uuid::Uuid::new_v4().to_string());
+
         // Apply meta settings
         self.apply_meta(&mut schematic, &yaml_sch.meta)?;
 
@@ -708,6 +713,43 @@ connections:
         let output = result.unwrap();
         // GND is a power net, should create a global label
         assert!(!output.schematic.global_labels.is_empty() || !output.schematic.labels.is_empty());
+    }
+
+    #[test]
+    fn test_compile_component_instance_path_uses_hierarchy_root_uuid_not_file_uuid() {
+        // A placed component's `instances` path used to chain from the schematic file's own
+        // `uuid` header field. Real KiCad tracks the hierarchy-path root as a separate,
+        // project-wide uuid (in a real project, .kicad_pro's
+        // schematic.top_level_sheets[0].uuid) — using the file's own uuid instead produces a
+        // path KiCad silently discards and regenerates on first GUI open ("was automatically
+        // fixed, please save"), even for a single-sheet, non-hierarchical schematic like this.
+        let yaml = r#"
+components:
+  R1:
+    symbol: Device:R
+    position: [100, 50]
+    value: 10k
+"#;
+        let result = compile_yaml_str(yaml);
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+
+        let output = result.unwrap();
+        let hierarchy_root_uuid = output
+            .schematic
+            .hierarchy_root_uuid
+            .as_ref()
+            .expect("compile() should always set hierarchy_root_uuid");
+        assert_ne!(hierarchy_root_uuid, &output.schematic.uuid);
+
+        let r1 = output
+            .schematic
+            .find_symbol_by_reference("R1")
+            .expect("R1 should be placed");
+        assert_eq!(r1.instances.len(), 1);
+        assert_eq!(
+            r1.instances[0].paths[0].path,
+            format!("/{}", hierarchy_root_uuid)
+        );
     }
 
     #[test]

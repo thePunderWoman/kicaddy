@@ -105,6 +105,17 @@ pub struct Schematic {
     pub sheet_instances: Vec<SheetInstance>,
     /// Whether to embed fonts
     pub embedded_fonts: bool,
+    /// The project-wide "top-level sheet" uuid used as the leading segment of every
+    /// hierarchical instance path (component `instances`, sheet `instances`, child
+    /// `sheet_instances`) throughout a multi-sheet project. KiCad tracks this uuid
+    /// separately from any individual file's own `uuid` field — it lives in the
+    /// `.kicad_pro` project file's `schematic.top_level_sheets[0].uuid` and stays the
+    /// same across every screen in the hierarchy, root included. Using the root
+    /// schematic's own file uuid here instead (an easy mistake, since kicaddy doesn't
+    /// otherwise model or write a `.kicad_pro`) produces hierarchy paths KiCad silently
+    /// discards and regenerates on first GUI open. `None` falls back to the file's own
+    /// `uuid`, which is only correct for a schematic that was never given a real one.
+    pub hierarchy_root_uuid: Option<String>,
 }
 
 impl Schematic {
@@ -138,6 +149,7 @@ impl Schematic {
                 page: "1".to_string(),
             }],
             embedded_fonts: false,
+            hierarchy_root_uuid: None,
         }
     }
 
@@ -306,12 +318,18 @@ impl Schematic {
             })
             .collect();
 
-        // Create project instance with reference
-        // The path is "/{schematic_uuid}" for the root sheet
+        // Create project instance with reference.
+        // The path is "/{hierarchy_root_uuid}" — NOT "/{self.uuid}". KiCad tracks the
+        // hierarchy-path root identity as a project-wide uuid separate from any individual
+        // file's own uuid (see `Schematic::hierarchy_root_uuid`'s doc comment); using the
+        // file's own uuid here produces a path KiCad discards and regenerates on first open.
         let project_instance = ProjectInstance {
             project_name: String::new(), // Empty project name for standalone schematics
             paths: vec![PathInstance {
-                path: format!("/{}", self.uuid),
+                path: format!(
+                    "/{}",
+                    self.hierarchy_root_uuid.as_deref().unwrap_or(&self.uuid)
+                ),
                 reference: ref_value.clone(),
                 unit: 1,
             }],
@@ -1064,6 +1082,11 @@ pub struct Sheet {
     pub on_board: bool,
     /// Fields autoplaced
     pub fields_autoplaced: bool,
+    /// Hierarchical instance info for this sheet symbol itself (project name + path/page
+    /// entries) — the `(instances ...)` sub-block KiCad expects on every `(sheet ...)` block.
+    /// Empty means the sub-block is omitted entirely, which is what triggers KiCad's "was
+    /// automatically fixed, please save" dialog on first open.
+    pub instances: Vec<SheetProjectInstance>,
 }
 
 /// Sheet instance information
@@ -1071,6 +1094,14 @@ pub struct Sheet {
 pub struct SheetInstance {
     pub path: String,
     pub page: String,
+}
+
+/// Hierarchical instance info for a sheet symbol, grouped by project (mirrors
+/// `ProjectInstance`, which serves the same role for placed components).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SheetProjectInstance {
+    pub project_name: String,
+    pub paths: Vec<SheetInstance>,
 }
 
 /// Routing mode for wire placement
